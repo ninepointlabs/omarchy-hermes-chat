@@ -125,12 +125,25 @@ Panel {
     root.transcript = Array.isArray(parsed.transcript) ? parsed.transcript : []
     root.freshChatPending = !!parsed.freshChatPending
     root.notifyOnAnswers = !!parsed.notifyOnAnswers
+    root.scrollToLatest()
   }
 
   function appendTranscript(entry) {
     // Cap history so the state file (re-read on every open) can't grow
     // without bound over weeks of quick-chat use.
     root.transcript = root.transcript.concat([entry]).slice(-20)
+    root.scrollToLatest()
+  }
+
+  // Jumps the transcript scroll area to the newest message. Qt.callLater
+  // defers this past the Repeater/Column relayout that follows a
+  // transcript change, so contentHeight is already current when this runs
+  // — calling it synchronously would scroll to where the *old* content
+  // ended, one message behind.
+  function scrollToLatest() {
+    Qt.callLater(function() {
+      transcriptFlick.contentY = Math.max(0, transcriptFlick.contentHeight - transcriptFlick.height)
+    })
   }
 
   function setNotifyPref(value) {
@@ -298,7 +311,17 @@ Panel {
     // parent chain) when the field isn't showing, e.g. hermes CLI missing.
     focusTarget: root.hermesAvailable ? draftField : escCatcher
     contentWidth: panel.fittedContentWidth(Style.space(380))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(520))
+    // Full natural height (header + every transcript line + footer) is what
+    // the panel WOULD be with no internal scrolling; fittedContentHeight
+    // caps it at 520px. When it's under the cap, transcriptFlick ends up
+    // exactly as tall as its content and never scrolls — same look as
+    // before this changed. When it's over, the footer (composer + quick
+    // actions) still gets its full natural height since it's bottom-anchored
+    // outside the scroll area, and transcriptFlick absorbs the deficit.
+    contentHeight: panel.fittedContentHeight(
+      topSection.implicitHeight + Style.space(12) + transcriptColumn.implicitHeight + Style.space(12) + bottomSection.implicitHeight,
+      Style.space(520)
+    )
 
     Item {
       id: escCatcher
@@ -306,11 +329,72 @@ Panel {
       focus: true
       Keys.onEscapePressed: root.close()
 
+      Column {
+        id: topSection
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        spacing: Style.space(12)
+
+        PanelHero {
+          width: parent.width
+          title: "Hermes"
+          meta: !root.hermesAvailable ? "hermes CLI not found on PATH"
+            : root.busy ? "Thinking…"
+            : "Ready"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+        }
+
+        Text {
+          visible: root.errorText !== ""
+          width: parent.width
+          text: root.errorText
+          textFormat: Text.PlainText
+          color: root.urgent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+        }
+
+        // --- hermes CLI missing --------------------------------------------
+        Column {
+          visible: !root.hermesAvailable
+          width: parent.width
+          spacing: Style.space(8)
+
+          Text {
+            width: parent.width
+            text: "The `hermes` command isn't on PATH for this shell, so quick chat can't run. Open a terminal and run `hermes doctor` to check your install."
+            textFormat: Text.PlainText
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+
+          Button {
+            text: "Re-check"
+            foreground: root.foreground
+            bordered: true
+            onClicked: root.checkHermesAvailable()
+          }
+        }
+      }
+
+      // --- transcript — the only scrolling region. Pinned between
+      // topSection and bottomSection so the composer below is never
+      // scrolled out of view, however long the conversation gets.
       Flickable {
-        id: panelFlick
-        anchors.fill: parent
+        id: transcriptFlick
+        anchors.top: topSection.bottom
+        anchors.topMargin: Style.space(12)
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: bottomSection.top
+        anchors.bottomMargin: Style.space(12)
         contentWidth: width
-        contentHeight: column.implicitHeight
+        contentHeight: transcriptColumn.implicitHeight
         clip: true
         boundsBehavior: Flickable.StopAtBounds
         flickableDirection: Flickable.VerticalFlick
@@ -318,167 +402,123 @@ Panel {
         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
         Column {
-          id: column
-          width: panelFlick.width
-          spacing: Style.space(12)
+          id: transcriptColumn
+          visible: root.hermesAvailable && root.transcript.length > 0
+          width: transcriptFlick.width
+          spacing: Style.space(8)
 
-          PanelHero {
+          Repeater {
+            model: root.transcript
+            delegate: Column {
+              required property var modelData
+              width: transcriptColumn.width
+              spacing: Style.space(2)
+
+              Text {
+                width: parent.width
+                text: modelData.role === "user" ? "You" : "Hermes"
+                textFormat: Text.PlainText
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
+
+              Text {
+                width: parent.width
+                // Plain text, deliberately: this renders your own typed
+                // messages AND the model's replies. AutoText's default
+                // markup-sniffing could otherwise turn adversarial-looking
+                // content (a stray <img>/<a> the model echoes) into a live
+                // rendered link or image fetch instead of inert text.
+                text: modelData.text
+                textFormat: Text.PlainText
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                wrapMode: Text.WordWrap
+              }
+            }
+          }
+        }
+      }
+
+      // --- composer + quick actions — fixed to the bottom, always visible.
+      Column {
+        id: bottomSection
+        anchors.bottom: parent.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        spacing: Style.space(12)
+
+        Column {
+          visible: root.hermesAvailable
+          width: parent.width
+          spacing: Style.space(6)
+
+          TextField {
+            id: draftField
             width: parent.width
-            title: "Hermes"
-            meta: !root.hermesAvailable ? "hermes CLI not found on PATH"
-              : root.busy ? "Thinking…"
-              : "Ready"
+            enabled: !root.busy
+            placeholderText: root.freshChatPending ? "Start a new chat…" : "Continue your latest chat…"
             foreground: root.foreground
-            fontFamily: root.fontFamily
+            text: root.draft
+            onTextChanged: root.draft = text
+            Keys.onReturnPressed: root.sendMessage()
           }
 
-          Text {
-            visible: root.errorText !== ""
-            width: parent.width
-            text: root.errorText
-            textFormat: Text.PlainText
-            color: root.urgent
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.WordWrap
-          }
+          Row {
+            spacing: Style.space(6)
 
-          // --- hermes CLI missing ------------------------------------------
-          Column {
-            visible: !root.hermesAvailable
-            width: parent.width
-            spacing: Style.space(8)
-
-            Text {
-              width: parent.width
-              text: "The `hermes` command isn't on PATH for this shell, so quick chat can't run. Open a terminal and run `hermes doctor` to check your install."
-              textFormat: Text.PlainText
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              wrapMode: Text.WordWrap
+            Button {
+              text: root.busy ? "Thinking…" : "Send"
+              foreground: root.foreground
+              bordered: true
+              enabled: !root.busy && root.draft.trim().length > 0
+              onClicked: root.sendMessage()
             }
 
             Button {
-              text: "Re-check"
-              foreground: root.foreground
+              visible: root.busy
+              text: "Stop"
+              foreground: root.urgent
               bordered: true
-              onClicked: root.checkHermesAvailable()
+              onClicked: chatProcess.running = false
             }
           }
+        }
 
-          // --- transcript ----------------------------------------------------
-          Column {
-            visible: root.hermesAvailable && root.transcript.length > 0
-            width: parent.width
-            spacing: Style.space(8)
+        PanelSeparator { foreground: root.foreground }
 
-            Repeater {
-              model: root.transcript
-              delegate: Column {
-                required property var modelData
-                width: column.width
-                spacing: Style.space(2)
+        Column {
+          width: parent.width
+          spacing: Style.space(8)
 
-                Text {
-                  width: parent.width
-                  text: modelData.role === "user" ? "You" : "Hermes"
-                  textFormat: Text.PlainText
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  font.bold: true
-                }
-
-                Text {
-                  width: parent.width
-                  // Plain text, deliberately: this renders your own typed
-                  // messages AND the model's replies. AutoText's default
-                  // markup-sniffing could otherwise turn adversarial-looking
-                  // content (a stray <img>/<a> the model echoes) into a live
-                  // rendered link or image fetch instead of inert text.
-                  text: modelData.text
-                  textFormat: Text.PlainText
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                  wrapMode: Text.WordWrap
-                }
-              }
-            }
-          }
-
-          // --- composer --------------------------------------------------
-          Column {
-            visible: root.hermesAvailable
-            width: parent.width
+          Row {
             spacing: Style.space(6)
 
-            TextField {
-              id: draftField
-              width: parent.width
-              enabled: !root.busy
-              placeholderText: root.freshChatPending ? "Start a new chat…" : "Continue your latest chat…"
+            Button {
+              text: "New chat"
               foreground: root.foreground
-              text: root.draft
-              onTextChanged: root.draft = text
-              Keys.onReturnPressed: root.sendMessage()
+              bordered: true
+              onClicked: root.newChat()
             }
 
-            Row {
-              spacing: Style.space(6)
-
-              Button {
-                text: root.busy ? "Thinking…" : "Send"
-                foreground: root.foreground
-                bordered: true
-                enabled: !root.busy && root.draft.trim().length > 0
-                onClicked: root.sendMessage()
-              }
-
-              Button {
-                visible: root.busy
-                text: "Stop"
-                foreground: root.urgent
-                bordered: true
-                onClicked: chatProcess.running = false
-              }
+            Button {
+              text: "Show full desktop app"
+              foreground: root.foreground
+              bordered: true
+              onClicked: root.showFullApp()
             }
           }
 
-          PanelSeparator { foreground: root.foreground }
-
-          // --- quick actions -----------------------------------------------
-          Column {
+          Toggle {
             width: parent.width
-            spacing: Style.space(8)
-
-            Row {
-              spacing: Style.space(6)
-
-              Button {
-                text: "New chat"
-                foreground: root.foreground
-                bordered: true
-                onClicked: root.newChat()
-              }
-
-              Button {
-                text: "Show full desktop app"
-                foreground: root.foreground
-                bordered: true
-                onClicked: root.showFullApp()
-              }
-            }
-
-            Toggle {
-              width: parent.width
-              label: "Notify me on answers"
-              description: "Native notification when a reply lands while this dropdown is closed."
-              checked: root.notifyOnAnswers
-              foreground: root.foreground
-              onClicked: root.setNotifyPref(!root.notifyOnAnswers)
-            }
+            label: "Notify me on answers"
+            description: "Native notification when a reply lands while this dropdown is closed."
+            checked: root.notifyOnAnswers
+            foreground: root.foreground
+            onClicked: root.setNotifyPref(!root.notifyOnAnswers)
           }
         }
       }
