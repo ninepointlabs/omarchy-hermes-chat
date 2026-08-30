@@ -1,5 +1,7 @@
 # Hermes Chat (Omarchy plugin)
 
+![Hermes Chat preview](preview.png)
+
 A bar icon for the Omarchy shell (Quickshell) that lets you send a quick
 message to your local [Hermes](https://github.com/NousResearch) agent from
 the dropdown, without opening the desktop app.
@@ -13,11 +15,9 @@ Electron app is open, and does **not** require the persistent gateway
 
 - **Bar icon** — a small chat-bubble mark; turns to your bar's urgent color
   if the `hermes` command isn't found on PATH.
-- **Keyboard shortcut** — `SUPER + H` toggles the dropdown open/closed from
-  anywhere, without touching the mouse. Wired in
-  `~/.config/hypr/bindings.lua` via
-  `omarchy-shell shell toggle tim.hermes-chat` — the same IPC call
-  `omarchy menu keybindings` lists it under.
+- **Optional keyboard shortcut** — toggle the dropdown without touching the
+  mouse. Not wired automatically; see [Optional: keyboard
+  shortcut](#optional-keyboard-shortcut) below.
 - **Quick chat** — type a message, hit Enter (or click Send). It runs
   `hermes -z "<message>" -c` (one-shot mode, continuing your most recently
   active Hermes conversation) and shows the reply inline. One-shot turns can
@@ -29,11 +29,25 @@ Electron app is open, and does **not** require the persistent gateway
 - **Show full desktop app** — focuses the Hermes window if it's already
   open (`hyprctl dispatch focuswindow`), or launches it
   (`hermes desktop --skip-build`) if it isn't.
-- **Notify me on answers** — a toggle, persisted to
-  `~/.local/state/omarchy/hermes-chat/notify`. When on, you get a
-  `notify-send` notification with a preview of the reply, but only if the
-  dropdown was closed when the reply arrived (so you don't get pinged for
-  something you were already watching).
+- **Notify me on answers** — a toggle, persisted (along with your recent
+  conversation) to `~/.local/state/omarchy/hermes-chat/state.json`. When
+  on, you get a `notify-send` notification with a preview of the reply,
+  but only if the dropdown was closed when the reply arrived (so you don't
+  get pinged for something you were already watching).
+
+## Dependencies
+
+- The [Hermes](https://github.com/NousResearch) agent, with `hermes` on
+  `$PATH` — this plugin is a thin front end over the CLI, not a
+  reimplementation.
+- Hyprland (`hyprctl`) and `notify-send`, both standard on an Omarchy
+  install — used for "Show full desktop app" and reply notifications
+  respectively. Neither is required for quick chat itself to work.
+- `bash`, for the small scripts that read/write this plugin's own state
+  file and shell out to the above.
+
+No Node, Python, or other runtime is required — it's plain QML plus
+standard command-line tools.
 
 ## Why "continue the latest chat" instead of "the focused session"
 
@@ -73,16 +87,31 @@ omarchy plugin disable tim.hermes-chat            # take it off the bar
 omarchy plugin enable tim.hermes-chat             # put it back
 ```
 
+## Optional: keyboard shortcut
+
+Not set up by `install.sh` — it edits your Hyprland config, which felt
+like the wrong thing to do without asking. To toggle the dropdown with a
+key combo instead of clicking the bar icon, add a line like this to
+`~/.config/hypr/bindings.lua` (pick any combo `omarchy menu keybindings
+--print` doesn't already list):
+
+```lua
+o.bind("SUPER + H", "Hermes chat", "omarchy-shell shell toggle tim.hermes-chat")
+```
+
+Then run `hyprctl reload`.
+
 ## Uninstall
 
 ```bash
 omarchy plugin disable tim.hermes-chat
 rm ~/.config/omarchy/plugins/hermes-chat
-rm -rf ~/.local/state/omarchy/hermes-chat   # drops the notify preference too
+rm -rf ~/.local/state/omarchy/hermes-chat   # drops the conversation/notify state too
 ```
 
-Also remove the `SUPER + H` binding from `~/.config/hypr/bindings.lua` and run
-`hyprctl reload`, or it'll just no-op harmlessly once the plugin is gone.
+If you set up the optional keybind above, remove that line from
+`~/.config/hypr/bindings.lua` and run `hyprctl reload` — otherwise it just
+no-ops harmlessly once the plugin is gone.
 
 ## Notes for future changes
 
@@ -98,3 +127,7 @@ base classes and controls this plugin builds on — same components
 Omarchy shell updates as long as those don't change shape. `omarchy plugin
 validate <folder>` (ships with Omarchy) checks the manifest against the
 current schema if something breaks later.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
