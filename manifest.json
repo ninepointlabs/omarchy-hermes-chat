@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "tim.hermes-chat",
+  "name": "Hermes Chat",
+  "version": "0.1.0",
+  "author": "tim",
+  "description": "Bar icon + dropdown for sending a quick message to your local Hermes agent without opening the desktop app.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Hermes Chat",
+    "description": "Quick chat, new chat, and reply notifications for your local Hermes agent.",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
