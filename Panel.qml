@@ -109,11 +109,19 @@ Panel {
       freshChatPending: root.freshChatPending,
       notifyOnAnswers: root.notifyOnAnswers
     })
-    // chmod 700/600: this file accumulates real conversation content, so it
-    // shouldn't inherit the default (often group/world-readable) umask.
+    // Write via a same-directory temp file + rename rather than a direct
+    // `> "$0"` redirect: a redirect follows a symlink planted at that path
+    // (predictable, in a dir the plugin itself created) straight through
+    // to whatever it points at, and there'd be a window before chmod where
+    // the file sits at the default umask. mktemp creates its file at 0600
+    // up front (chmod is redundant but explicit), and mv on the same
+    // filesystem is a rename(2), which replaces the destination directory
+    // entry atomically instead of writing through it — so a symlink at the
+    // final path gets replaced, never followed.
     stateWriteProcess.command = [root.bin.bash, "-c",
-      "d=\"$(dirname \"$0\")\" && mkdir -p \"$d\" && chmod 700 \"$d\" && " +
-      "printf '%s' \"$1\" > \"$0\" && chmod 600 \"$0\"",
+      "set -e; d=\"$(dirname \"$0\")\"; mkdir -p \"$d\"; chmod 700 \"$d\"; " +
+      "tmp=\"$(mktemp \"$d/.state.json.XXXXXX\")\"; chmod 600 \"$tmp\"; " +
+      "if printf '%s' \"$1\" > \"$tmp\"; then mv -f \"$tmp\" \"$0\"; else rm -f \"$tmp\"; exit 1; fi",
       root.statePath, payload
     ]
     stateWriteProcess.running = true
