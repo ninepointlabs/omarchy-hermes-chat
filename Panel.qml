@@ -7,14 +7,15 @@ import qs.Commons
 import qs.Ui
 
 // Bar icon + dropdown for talking to the local `hermes` CLI without opening
-// the Hermes desktop app. Each send runs `hermes -z "<text>"` (one-shot
-// mode) as its own child process — there is no daemon here, matching the
-// CLI's own model where a one-shot turn doesn't require the persistent
-// gateway. `-c`/`--continue` is added on every send except the one right
-// after "New chat", so quick chat naturally continues whatever Hermes
-// conversation is currently most recent (there's no way for a plugin
-// outside the desktop app to know which *GUI* session has focus, so
-// "most recent" is the closest available stand-in).
+// the Hermes desktop app. Each send runs `hermes chat -Q --oneshot
+// --query-file -` (one-shot mode, message piped over stdin rather than
+// argv) as its own child process, in its own process group — there is no
+// daemon here, matching the CLI's own model where a one-shot turn doesn't
+// require the persistent gateway. `-c`/`--continue` is added on every send
+// except the one right after "New chat", so quick chat naturally continues
+// whatever Hermes conversation is currently most recent (there's no way for
+// a plugin outside the desktop app to know which *GUI* session has focus,
+// so "most recent" is the closest available stand-in).
 //
 // One-shot turns can take anywhere from a few seconds to tens of seconds
 // (model + tool-loop latency) — the panel shows a busy state and lets you
@@ -52,6 +53,28 @@ Panel {
     hyprctl: "hyprctl", pgrep: "pgrep", setsid: "setsid"
   })
   readonly property int maxReplyChars: 4000
+  // Streaming caps on the chat subprocess's collected stdout/stderr: a
+  // faulty or hostile `hermes` run (or a tool it calls) could otherwise
+  // flood output forever with StdioCollector buffering all of it until exit.
+  // These are checked as the text streams in (onTextChanged), not just once
+  // at the end, so a runaway job gets killed within roughly one more read
+  // chunk of crossing the cap rather than after it finally exits.
+  readonly property int maxStdoutChars: 262144
+  readonly property int maxStderrChars: 65536
+  // Soft deadline passed to `hermes --run-budget`: the agent gets a wrap-up
+  // nudge at 80% elapsed and tries to land a response before this. The hard
+  // deadline below is the actual enforcement — this just makes a clean
+  // finish more likely before that kicks in.
+  readonly property int chatRunBudgetSeconds: 240
+  // Hard local deadline: if the job hasn't exited by here, it's killed
+  // regardless of what --run-budget did or didn't manage on its own.
+  readonly property int chatHardTimeoutSeconds: 300
+  // Grace window between TERM and KILL when stopping a chat job — same
+  // window the process-group wrapper below uses internally.
+  readonly property int killGraceSeconds: 3
+  // Set right before killChatProcess() signals the job, so onExited can show
+  // *why* it ended instead of a bare "hermes exited with code N".
+  property string _killReason: ""
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -167,16 +190,48 @@ Panel {
     root.appendTranscript({ role: "user", text: text })
     root.draft = ""
 
-    var args = [root.bin.hermes, "-z", text]
-    if (!root.freshChatPending) args.push("-c")
+    // `hermes chat --query-file -` reads the message from stdin instead of
+    // argv, so the full text (pasted secrets included) never shows up in
+    // `ps`/`/proc/<pid>/cmdline` for the life of the request. `-Q --oneshot`
+    // reproduces the old top-level `-z`'s contract of "stdout carries only
+    // the final response text" (session id / warnings go to stderr).
+    var hermesArgs = [root.bin.hermes, "chat", "-Q", "--oneshot", "--query-file", "-",
+      "--run-budget", String(root.chatRunBudgetSeconds)]
+    if (!root.freshChatPending) hermesArgs.push("-c")
     root.freshChatPending = false
     root.writeState()
 
     root.busy = true
     root._stdout = ""
     root._stderr = ""
-    chatProcess.command = args
+    root._killReason = ""
+
+    // Run the real command in its own process group (`set -m` job control
+    // makes the backgrounded job's pgid its own pid) so a TERM sent to that
+    // group reaches every descendant Hermes' tool loop spawned, not just the
+    // immediate child. The trap self-escalates to KILL after a grace period,
+    // entirely inside this spawned shell — that cleanup runs to completion
+    // even if this plugin/panel is gone by the time it fires.
+    var script = "set -m; \"$@\" & pid=$!; trap \"kill -TERM -$pid 2>/dev/null; " +
+      "sleep " + root.killGraceSeconds + "; kill -KILL -$pid 2>/dev/null\" TERM; " +
+      "wait \"$pid\"; exit \"$?\""
+    chatProcess.command = [root.bin.bash, "-c", script, "--"].concat(hermesArgs)
     chatProcess.running = true
+    // Written to the child's stdin, never to argv — see the comment above.
+    chatProcess.write(text)
+    chatProcess.stdinEnabled = false
+    chatDeadlineTimer.restart()
+  }
+
+  // Sends TERM to the whole job (see the wrapper script in sendMessage()),
+  // which self-escalates to KILL if the group hasn't exited within
+  // killGraceSeconds. Used by the Stop button, the hard deadline, and
+  // panel/plugin teardown.
+  function killChatProcess(reason) {
+    if (!chatProcess.running) return
+    root._killReason = reason
+    chatProcess.signal(15) // SIGTERM
+    killFallbackTimer.restart()
   }
 
   function newChat() {
@@ -209,6 +264,11 @@ Panel {
   onOpenedChanged: if (opened) { root.errorText = ""; root.readState() }
 
   Component.onCompleted: root.resolveBinaries()
+  // Panel/plugin teardown: fire TERM at whatever chat job is still running.
+  // The wrapper's own trap escalates to KILL on its own timeline (see
+  // sendMessage()), so that cleanup still runs to completion even though
+  // this component and its Timers are being destroyed right now.
+  Component.onDestruction: if (chatProcess.running) chatProcess.signal(15)
 
   Process {
     id: resolveBinsProcess
@@ -255,18 +315,33 @@ Panel {
     id: chatProcess
     running: false
     command: []
+    stdinEnabled: true
     stdout: StdioCollector {
       id: chatStdout
       waitForEnd: true
+      // Checked on every chunk, not just at the end: a runaway job gets
+      // killed as soon as accumulated text crosses the cap rather than
+      // after StdioCollector has already buffered everything up to exit.
+      onTextChanged: if (text.length > root.maxStdoutChars)
+        root.killChatProcess("Hermes produced too much output and was stopped.")
       onStreamFinished: root._stdout = text
     }
     stderr: StdioCollector {
       id: chatStderr
       waitForEnd: true
+      onTextChanged: if (text.length > root.maxStderrChars)
+        root.killChatProcess("Hermes produced too much error output and was stopped.")
       onStreamFinished: root._stderr = text
     }
     onExited: function(exitCode) {
       root.busy = false
+      chatDeadlineTimer.stop()
+      killFallbackTimer.stop()
+      if (root._killReason) {
+        root.errorText = root._killReason
+        root._killReason = ""
+        return
+      }
       if (exitCode === 0) {
         var full = root._stdout.trim() || "(empty response)"
         var reply = full.length > root.maxReplyChars
@@ -279,9 +354,36 @@ Panel {
           notifyProcess.running = true
         }
       } else {
-        root.errorText = root._stderr.trim() || ("hermes exited with code " + exitCode)
+        // Unlike the old top-level `-z` (which redirected the whole run's
+        // stdout to devnull and only printed the final response at the
+        // very end), some `hermes chat` failure paths — e.g. an exhausted
+        // HTTP retry loop — print their message to stdout rather than
+        // stderr even under -Q. Check both so a real error doesn't get
+        // swallowed in favor of a bare "session_id: ..." line on stderr.
+        var errText = [root._stderr.trim(), root._stdout.trim()]
+          .filter(function(s) { return s.length > 0 }).join("\n")
+        root.errorText = errText || ("hermes exited with code " + exitCode)
       }
     }
+  }
+
+  // Hard deadline for a chat job: if it's still running when this fires,
+  // it's killed regardless of --run-budget.
+  Timer {
+    id: chatDeadlineTimer
+    interval: root.chatHardTimeoutSeconds * 1000
+    repeat: false
+    onTriggered: root.killChatProcess(
+      "Hermes didn't respond within " + root.chatHardTimeoutSeconds + "s and was stopped.")
+  }
+
+  // Last-resort hard stop if the process-group wrapper's own TERM/KILL
+  // escalation somehow didn't bring the job down in time.
+  Timer {
+    id: killFallbackTimer
+    interval: (root.killGraceSeconds + 5) * 1000
+    repeat: false
+    onTriggered: if (chatProcess.running) chatProcess.running = false
   }
 
   Process {
@@ -491,7 +593,7 @@ Panel {
               text: "Stop"
               foreground: root.urgent
               bordered: true
-              onClicked: chatProcess.running = false
+              onClicked: root.killChatProcess("Stopped.")
             }
           }
         }
