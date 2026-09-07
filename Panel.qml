@@ -44,6 +44,9 @@ Panel {
   property var transcript: [] // [{ role: "user"|"assistant", text }]
   property string _stdout: ""
   property string _stderr: ""
+  // Latest state payload waiting for stateWriteProcess to be free (see
+  // flushState()); only the newest matters, so later writes replace it.
+  property string _pendingState: ""
   // Resolved once at startup to absolute paths (falls back to the bare name
   // if resolution fails) so command spawning doesn't trust whatever
   // happens to be first on $PATH — matches nostr-signer's convention of
@@ -53,14 +56,17 @@ Panel {
     hyprctl: "hyprctl", pgrep: "pgrep", setsid: "setsid"
   })
   readonly property int maxReplyChars: 4000
-  // Streaming caps on the chat subprocess's collected stdout/stderr: a
-  // faulty or hostile `hermes` run (or a tool it calls) could otherwise
-  // flood output forever with StdioCollector buffering all of it until exit.
-  // These are checked as the text streams in (onTextChanged), not just once
-  // at the end, so a runaway job gets killed within roughly one more read
-  // chunk of crossing the cap rather than after it finally exits.
-  readonly property int maxStdoutChars: 262144
-  readonly property int maxStderrChars: 65536
+  // Byte caps on the chat subprocess's stdout/stderr, enforced *producer
+  // side* in the wrapper script below (see sendMessage()): each stream is
+  // piped through `head -c` in the spawned shell, so at most this many bytes
+  // ever reach Quickshell's StdioCollector, regardless of how much or how
+  // fast the job writes. The first byte past the cap kills the whole job's
+  // process group and makes the wrapper exit with a distinct status
+  // (excessStdoutExit / excessStderrExit) so the panel can say why.
+  readonly property int maxStdoutBytes: 262144
+  readonly property int maxStderrBytes: 65536
+  readonly property int excessStdoutExit: 201
+  readonly property int excessStderrExit: 202
   // Soft deadline passed to `hermes --run-budget`: the agent gets a wrap-up
   // nudge at 80% elapsed and tries to land a response before this. The hard
   // deadline below is the actual enforcement — this just makes a clean
@@ -127,11 +133,28 @@ Panel {
   }
 
   function writeState() {
-    var payload = JSON.stringify({
+    root._pendingState = JSON.stringify({
       transcript: root.transcript,
       freshChatPending: root.freshChatPending,
       notifyOnAnswers: root.notifyOnAnswers
     })
+    root.flushState()
+  }
+
+  // Starts the writer for whatever payload is pending, unless one is already
+  // in flight — in which case stateWriteProcess.onExited calls back here.
+  // Quickshell ignores `command` changes while a Process is running and
+  // write() goes to the *current* process, so without this guard two quick
+  // writes would push the second payload into the first writer's stdin.
+  function flushState() {
+    if (stateWriteProcess.running || !root._pendingState) return
+    var payload = root._pendingState
+    root._pendingState = ""
+    // The payload — which is the whole conversation transcript — is piped
+    // to the writer over stdin, never passed as an argv value, so prompts
+    // and model output don't sit in /proc/<pid>/cmdline for the life of the
+    // write. The only argv is the (non-secret) destination path.
+    //
     // Write via a same-directory temp file + rename rather than a direct
     // `> "$0"` redirect: a redirect follows a symlink planted at that path
     // (predictable, in a dir the plugin itself created) straight through
@@ -140,14 +163,20 @@ Panel {
     // up front (chmod is redundant but explicit), and mv on the same
     // filesystem is a rename(2), which replaces the destination directory
     // entry atomically instead of writing through it — so a symlink at the
-    // final path gets replaced, never followed.
+    // final path gets replaced, never followed. `head -c` bounds what the
+    // writer will ever accept, mirroring the cap on the read side.
     stateWriteProcess.command = [root.bin.bash, "-c",
       "set -e; d=\"$(dirname \"$0\")\"; mkdir -p \"$d\"; chmod 700 \"$d\"; " +
       "tmp=\"$(mktemp \"$d/.state.json.XXXXXX\")\"; chmod 600 \"$tmp\"; " +
-      "if printf '%s' \"$1\" > \"$tmp\"; then mv -f \"$tmp\" \"$0\"; else rm -f \"$tmp\"; exit 1; fi",
-      root.statePath, payload
+      "if head -c 1048576 > \"$tmp\"; then mv -f \"$tmp\" \"$0\"; else rm -f \"$tmp\"; exit 1; fi",
+      root.statePath
     ]
     stateWriteProcess.running = true
+    stateWriteProcess.write(payload)
+    stateWriteProcess.stdinEnabled = false
+    // Re-arm for the next write: stdinEnabled=false closes the channel for
+    // the running process, and a later `true` only applies to the next one.
+    stateWriteProcess.stdinEnabled = true
   }
 
   function applyState(text) {
@@ -212,14 +241,38 @@ Panel {
     // immediate child. The trap self-escalates to KILL after a grace period,
     // entirely inside this spawned shell — that cleanup runs to completion
     // even if this plugin/panel is gone by the time it fires.
-    var script = "set -m; \"$@\" & pid=$!; trap \"kill -TERM -$pid 2>/dev/null; " +
-      "sleep " + root.killGraceSeconds + "; kill -KILL -$pid 2>/dev/null\" TERM; " +
-      "wait \"$pid\"; exit \"$?\""
-    chatProcess.command = [root.bin.bash, "-c", script, "--"].concat(hermesArgs)
+    //
+    // The job's stdout and stderr each go through a `limit` process
+    // substitution rather than straight to Quickshell: `head -c N` forwards
+    // at most N bytes, and if even one more byte follows, the limiter sends
+    // USR1 (stdout) or USR2 (stderr) back to this wrapper, which kills the
+    // job's whole group and exits with a distinct code. So the caps are
+    // enforced where the bytes are produced — the shell only ever receives
+    // a bounded buffer, and never has to react after the fact. The
+    // wrapper's own argv carries only these numbers and the hermes flags;
+    // the message itself is written to stdin below.
+    var script = "set -m; maxout=$1; maxerr=$2; grace=$3; shift 3; pid=''; excess=0; " +
+      "limit() { head -c \"$1\"; if [ \"$(head -c 1 | wc -c)\" -gt 0 ]; then kill -\"$2\" \"$$\" 2>/dev/null; fi; }; " +
+      "stop() { if [ -n \"$pid\" ]; then kill -TERM -- \"-$pid\" 2>/dev/null; sleep \"$grace\"; kill -KILL -- \"-$pid\" 2>/dev/null; fi; }; " +
+      "trap 'stop' TERM; " +
+      "trap 'excess=" + root.excessStdoutExit + "; stop' USR1; " +
+      "trap 'excess=" + root.excessStderrExit + "; stop' USR2; " +
+      "exec {out}> >(limit \"$maxout\" USR1); outpid=$!; " +
+      "exec {err}> >(limit \"$maxerr\" USR2 >&2); errpid=$!; " +
+      "\"$@\" >&\"$out\" 2>&\"$err\" & pid=$!; " +
+      "exec {out}>&- {err}>&-; " +
+      "wait \"$pid\"; rc=$?; wait \"$outpid\" \"$errpid\" 2>/dev/null; " +
+      "if [ \"$excess\" -ne 0 ]; then exit \"$excess\"; fi; exit \"$rc\""
+    chatProcess.command = [root.bin.bash, "-c", script, "--",
+      String(root.maxStdoutBytes), String(root.maxStderrBytes), String(root.killGraceSeconds)
+    ].concat(hermesArgs)
     chatProcess.running = true
     // Written to the child's stdin, never to argv — see the comment above.
     chatProcess.write(text)
     chatProcess.stdinEnabled = false
+    // Re-arm for the next send: stdinEnabled=false closes the channel for
+    // the running process, and a later `true` only applies to the next one.
+    chatProcess.stdinEnabled = true
     chatDeadlineTimer.restart()
   }
 
@@ -303,6 +356,8 @@ Panel {
     id: stateWriteProcess
     running: false
     command: []
+    stdinEnabled: true
+    onExited: root.flushState()
   }
 
   Process {
@@ -316,21 +371,18 @@ Panel {
     running: false
     command: []
     stdinEnabled: true
+    // Both collectors only ever see a bounded stream: the wrapper script in
+    // sendMessage() caps each one producer-side (maxStdoutBytes /
+    // maxStderrBytes) and kills the job on the first excess byte, so there's
+    // nothing to police here — waitForEnd just hands over the bounded text.
     stdout: StdioCollector {
       id: chatStdout
       waitForEnd: true
-      // Checked on every chunk, not just at the end: a runaway job gets
-      // killed as soon as accumulated text crosses the cap rather than
-      // after StdioCollector has already buffered everything up to exit.
-      onTextChanged: if (text.length > root.maxStdoutChars)
-        root.killChatProcess("Hermes produced too much output and was stopped.")
       onStreamFinished: root._stdout = text
     }
     stderr: StdioCollector {
       id: chatStderr
       waitForEnd: true
-      onTextChanged: if (text.length > root.maxStderrChars)
-        root.killChatProcess("Hermes produced too much error output and was stopped.")
       onStreamFinished: root._stderr = text
     }
     onExited: function(exitCode) {
@@ -340,6 +392,14 @@ Panel {
       if (root._killReason) {
         root.errorText = root._killReason
         root._killReason = ""
+        return
+      }
+      if (exitCode === root.excessStdoutExit) {
+        root.errorText = "Hermes produced too much output and was stopped."
+        return
+      }
+      if (exitCode === root.excessStderrExit) {
+        root.errorText = "Hermes produced too much error output and was stopped."
         return
       }
       if (exitCode === 0) {
