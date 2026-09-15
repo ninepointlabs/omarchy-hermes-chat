@@ -1,5 +1,16 @@
-#!/bin/bash
+#!/usr/bin/bash
 set -euo pipefail
+
+# Fixed tool locations: this script never depends on what an earlier PATH
+# entry provides, and exported shell hooks don't reach the tools it runs.
+PATH=/usr/bin:/bin
+export PATH
+unset BASH_ENV ENV CDPATH GLOBIGNORE
+OMARCHY=/usr/share/omarchy/bin/omarchy
+if [ ! -x "$OMARCHY" ]; then
+  echo "Error: $OMARCHY not found; this installer is for Omarchy." >&2
+  exit 1
+fi
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PARENT="$HOME/.config/omarchy/plugins"
@@ -8,17 +19,13 @@ TARGET="$PARENT/hermes-chat"
 # No symlinks, real copies — matching how nostr-signer/ring-cameras are
 # installed. A symlinked directory doesn't get watched (inotify walks real
 # directories, not into ~/Projects through a dir symlink); per-file symlinks
-# didn't reliably work either — the target inodes live in a directory
-# ~/.config/omarchy/plugins never watches, so edits to the real files in
-# ~/Projects don't reliably surface as events on the watched directory.
-# Copying means re-running this script is what deploys an edit — there is
-# no live-symlink shortcut here.
+# didn't reliably work either. Copying means re-running this script is what
+# deploys an edit — there is no live-symlink shortcut here.
 mkdir -p "$PARENT"
 
 # Reject a symlinked destination outright rather than following it — a
-# symlink planted at $TARGET (by another process, or left over from a manual
-# install) would otherwise make `cp` write through to wherever it points
-# instead of the real plugin directory.
+# symlink planted at $TARGET would otherwise make the copy write through to
+# wherever it points instead of the real plugin directory.
 if [ -L "$TARGET" ]; then
   echo "Error: $TARGET is a symlink, not a plugin directory. Remove it and re-run this script." >&2
   exit 1
@@ -27,11 +34,17 @@ fi
 # Build the full install in a scratch directory next to $TARGET (same
 # filesystem, so the swap below is a rename) and validate THAT — never the
 # live install — so a validation failure can never leave $TARGET half
-# overwritten.
+# overwritten. `install` copies file contents with explicit modes.
 STAGE="$(mktemp -d "$PARENT/.hermes-chat.staging.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT
-cp "$DIR"/*.qml "$DIR"/manifest.json "$STAGE/"
-omarchy plugin validate "$STAGE"
+for file in "$DIR"/*.qml "$DIR"/Hermes.js "$DIR"/manifest.json; do
+  install -m 0644 "$file" "$STAGE/"
+done
+install -d -m 0755 "$STAGE/bin"
+for helper in bounded-run hermes-verify hermes-state; do
+  install -m 0755 "$DIR/bin/$helper" "$STAGE/bin/$helper"
+done
+"$OMARCHY" plugin validate "$STAGE"
 
 # Atomic swap: move the old install aside, rename the validated stage into
 # place, then drop the old copy. If the second rename fails partway, the old
@@ -52,9 +65,9 @@ else
 fi
 trap - EXIT
 
-echo "Installed $DIR/*.{qml,json} -> $TARGET/"
+echo "Installed $DIR -> $TARGET/"
 
-if omarchy bar put tim.hermes-chat; then
+if "$OMARCHY" bar put tim.hermes-chat; then
   echo "Added the Hermes Chat widget to your bar (right section)."
 else
   echo "Could not auto-add it to the bar; add it yourself with:"
@@ -63,9 +76,9 @@ fi
 
 # Confirmed by direct testing on this machine: neither the plugins-dir
 # inotify watcher NOR the `shell rescanPlugins` IPC call reliably force
-# Quickshell to recompile a changed QML file — both claim to reload but the
-# old bytecode keeps running. A full shell restart is the only thing that
-# was observed to actually pick up an edit. This restarts just the Omarchy
-# shell chrome (bar/panels) — other running apps are unaffected.
-omarchy restart shell
+# Quickshell to recompile a changed QML file. A full shell restart is the
+# only thing that was observed to actually pick up an edit. This restarts
+# just the Omarchy shell chrome (bar/panels) — other running apps are
+# unaffected.
+"$OMARCHY" restart shell
 echo "Restarted the Omarchy shell so this change is actually live (rescanPlugins alone was not enough on this machine)."

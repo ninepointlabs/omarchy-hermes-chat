@@ -1,0 +1,294 @@
+#!/usr/bin/python3 -I -S -B
+# hermes-state: the only reader and writer of Hermes Chat's state file,
+# ~/.local/state/omarchy/hermes-chat/state.json.
+#
+#   /usr/bin/python3 -I -S -B bin/hermes-state read    # state JSON on stdout
+#   /usr/bin/python3 -I -S -B bin/hermes-state write   # state JSON on stdin
+#
+# The transcript only ever crosses stdin/stdout; no conversation data is put
+# in argv or the environment.
+#
+# Every path component, from / down to the state directory, is opened with
+# O_DIRECTORY|O_NOFOLLOW relative to the descriptor of its parent, and each
+# opened descriptor is checked with fstat: a directory, owned by root or the
+# user above $HOME (root-owned sticky directories allowed), owned by the user
+# from $HOME down, never group/other writable. Missing directories below
+# $HOME are created 0700 with mkdir relative to the held parent. From then on
+# everything happens relative to the held state-directory descriptor, so
+# renaming or swapping any pathname component mid-operation changes nothing.
+#
+# read:  O_RDONLY|O_NOFOLLOW|O_NONBLOCK, then fstat: a regular file, owned by
+#        the user, mode 0600-or-stricter, one link, at most 1 MiB.
+# write: at most 1 MiB of a JSON object from stdin into a randomly named
+#        O_CREAT|O_EXCL|O_NOFOLLOW 0600 file in the held directory, fsync,
+#        renameat over state.json, fsync the directory. An existing state.json
+#        that is not the user's regular file is refused, not replaced.
+#
+# Exit status: 0 ok; 2 usage; 3 refused (unsafe path or file); 4 invalid input.
+
+import json
+import os
+import pwd
+import stat
+import sys
+
+STATE_COMPONENTS = (b".local", b"state", b"omarchy", b"hermes-chat")
+STATE_NAME = b"state.json"
+LEGACY_NOTIFY_NAME = b"notify"
+STATE_LIMIT = 1 << 20
+LEGACY_LIMIT = 16
+
+EXIT_USAGE = 2
+EXIT_REFUSED = 3
+EXIT_INVALID = 4
+
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+CREATE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_NOCTTY | os.O_CLOEXEC
+
+
+class Refused(Exception):
+    pass
+
+
+class Invalid(Exception):
+    pass
+
+
+def split_absolute(path):
+    if not path.startswith(b"/"):
+        raise Refused("home directory is not an absolute path")
+    parts = [p for p in path.split(b"/") if p]
+    if any(p in (b".", b"..") for p in parts):
+        raise Refused("home directory path is not canonical")
+    return parts
+
+
+def printable(name):
+    text = name.decode("utf-8", "replace")
+    return "".join(ch if ch.isprintable() else "?" for ch in text)[:120]
+
+
+def check_ancestor(fd, name, euid):
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        raise Refused("not a directory: " + printable(name))
+    if st.st_uid not in (0, euid):
+        raise Refused("directory owned by another user: " + printable(name))
+    writable = st.st_mode & 0o022
+    if writable and not (st.st_uid == 0 and st.st_mode & stat.S_ISVTX):
+        raise Refused("directory is writable by others: " + printable(name))
+
+
+def check_owned(fd, name, euid):
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        raise Refused("not a directory: " + printable(name))
+    if st.st_uid != euid:
+        raise Refused("directory not owned by you: " + printable(name))
+    if st.st_mode & 0o022:
+        raise Refused("directory is writable by others: " + printable(name))
+
+
+def open_directory(parent_fd, name):
+    try:
+        return os.open(name, DIRECTORY_FLAGS, dir_fd=parent_fd)
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise Refused("cannot open " + printable(name) + " as a real directory ("
+                      + os.strerror(error.errno) + ")")
+
+
+def open_state_directory(home, create, euid=None, components=STATE_COMPONENTS):
+    """Return a descriptor for the state directory, or None if it doesn't
+    exist and create is False. `home` is an absolute bytes path."""
+    euid = os.geteuid() if euid is None else euid
+    parts = split_absolute(home)
+    fd = os.open(b"/", DIRECTORY_FLAGS)
+    try:
+        check_ancestor(fd, b"/", euid)
+        for index, part in enumerate(parts):
+            child = open_directory(fd, part)
+            os.close(fd)
+            fd = child
+            if index == len(parts) - 1:
+                check_owned(fd, part, euid)
+            else:
+                check_ancestor(fd, part, euid)
+        for index, part in enumerate(components):
+            last = index == len(components) - 1
+            try:
+                child = open_directory(fd, part)
+            except FileNotFoundError:
+                if not create:
+                    os.close(fd)
+                    return None
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                child = open_directory(fd, part)
+            os.close(fd)
+            fd = child
+            check_owned(fd, part, euid)
+            if last and os.fstat(fd).st_mode & 0o077:
+                os.fchmod(fd, 0o700)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_file(dir_fd, name, limit, euid=None, private=True):
+    """Bytes of a safe regular file, or None if it doesn't exist."""
+    euid = os.geteuid() if euid is None else euid
+    try:
+        fd = os.open(name, READ_FLAGS, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise Refused(printable(name) + " is not a regular file (" + os.strerror(error.errno) + ")")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Refused(printable(name) + " is not a regular file")
+        if st.st_uid != euid:
+            raise Refused(printable(name) + " is not owned by you")
+        # 0 is fine: a concurrent writer renamed a newer state over the file
+        # after it was opened, and this read still sees one whole version.
+        if st.st_nlink > 1:
+            raise Refused(printable(name) + " has extra hard links")
+        if private and st.st_mode & 0o077:
+            raise Refused(printable(name) + " is readable by others")
+        if st.st_mode & 0o022:
+            raise Refused(printable(name) + " is writable by others")
+        if st.st_size > limit:
+            raise Refused(printable(name) + " is larger than " + str(limit) + " bytes")
+        chunks = []
+        total = 0
+        while total <= limit:
+            chunk = os.read(fd, limit + 1 - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > limit:
+            raise Refused(printable(name) + " is larger than " + str(limit) + " bytes")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def write_file(dir_fd, name, data, euid=None):
+    euid = os.geteuid() if euid is None else euid
+    try:
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != euid:
+            raise Refused(printable(name) + " exists and is not your regular file; not replacing it")
+    except FileNotFoundError:
+        pass
+    temporary = b"." + name + b"." + os.urandom(16).hex().encode() + b".tmp"
+    fd = os.open(temporary, CREATE_FLAGS, 0o600, dir_fd=dir_fd)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(temporary, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except BaseException:
+        try:
+            os.unlink(temporary, dir_fd=dir_fd)
+        except OSError:
+            pass
+        raise
+    os.fsync(dir_fd)
+
+
+def read_stdin(limit):
+    chunks = []
+    total = 0
+    while total <= limit:
+        chunk = os.read(0, min(65536, limit + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    if total > limit:
+        raise Invalid("state is larger than " + str(limit) + " bytes")
+    return b"".join(chunks)
+
+
+def validate_state(data):
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise Invalid("state is not valid JSON")
+    if not isinstance(value, dict):
+        raise Invalid("state is not a JSON object")
+    return value
+
+
+def read_state(home, euid=None):
+    dir_fd = open_state_directory(home, create=False, euid=euid)
+    if dir_fd is None:
+        return b"{}"
+    try:
+        data = read_file(dir_fd, STATE_NAME, STATE_LIMIT, euid=euid)
+        if data is not None:
+            validate_state(data)
+            return data
+        # Carry the notify preference over from the plugin's older prefs file.
+        legacy = read_file(dir_fd, LEGACY_NOTIFY_NAME, LEGACY_LIMIT, euid=euid, private=False)
+        if legacy is not None and legacy.strip() == b"1":
+            return b'{"notifyOnAnswers":true}'
+        return b"{}"
+    finally:
+        os.close(dir_fd)
+
+
+def write_state(home, data, euid=None):
+    validate_state(data)
+    dir_fd = open_state_directory(home, create=True, euid=euid)
+    try:
+        write_file(dir_fd, STATE_NAME, data, euid=euid)
+    finally:
+        os.close(dir_fd)
+
+
+def home_directory():
+    return os.fsencode(pwd.getpwuid(os.geteuid()).pw_dir)
+
+
+def main(argv):
+    if len(argv) != 1 or argv[0] not in ("read", "write"):
+        sys.stderr.write("usage: hermes-state read|write\n")
+        return EXIT_USAGE
+    try:
+        if argv[0] == "read":
+            data = read_state(home_directory())
+            view = memoryview(data)
+            while view:
+                view = view[os.write(1, view):]
+        else:
+            write_state(home_directory(), read_stdin(STATE_LIMIT))
+        return 0
+    except Refused as error:
+        sys.stderr.write("Hermes Chat state: refused: " + str(error) + "\n")
+        return EXIT_REFUSED
+    except Invalid as error:
+        sys.stderr.write("Hermes Chat state: " + str(error) + "\n")
+        return EXIT_INVALID
+    except OSError as error:
+        sys.stderr.write("Hermes Chat state: " + os.strerror(error.errno or 0) + "\n")
+        return EXIT_REFUSED
+
+
+if __name__ == "__main__":
+    sys.stdout.flush()
+    os._exit(main(sys.argv[1:]))

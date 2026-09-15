@@ -1,0 +1,535 @@
+#!/usr/bin/python3 -I -S -B
+# hermes-verify: bind Hermes Chat to the pacman-installed hermes-agent and
+# refuse to run it unless its whole runtime closure matches the package
+# manager's record.
+#
+# Always invoked by absolute path with a fixed interpreter and a cleared
+# environment (see Hermes.js):
+#   /usr/bin/python3 -I -S -B bin/hermes-verify check [--approve VER@MTREE]...
+#   /usr/bin/python3 -I -S -B bin/hermes-verify exec [--gui] [--approve VER@MTREE]... -- chat|desktop ...
+#
+# `check` prints one JSON object on stdout. `exec` verifies and then execs
+# /opt/hermes-agent/venv/bin/python -I -B -m hermes_cli.main directly (never
+# /usr/bin/hermes, never PATH), inheriting stdin, so the message is still read
+# from stdin and verification happens in the same process, immediately before
+# every use.
+#
+# What is verified, every time:
+#   * exactly one local pacman package named hermes-agent; its desc/mtree/files
+#     records and every directory above them are root-owned and not writable
+#     by group or others;
+#   * every entry in its mtree: type, root ownership, exact mode, size, symlink
+#     target, and the full SHA-256 of every regular file;
+#   * the interpreter the venv links to is a file of one of hermes-agent's
+#     declared dependencies (python311 today), whose mtree is verified the
+#     same way;
+#   * nothing importable was added: /opt/hermes-agent and the interpreter's
+#     standard library contain no entry the packages don't list, except
+#     root-owned __pycache__/*.pyc, and pyvenv.cfg keeps system site-packages
+#     off sys.path;
+#   * every directory above the install, the interpreter, and the package
+#     database is root-owned and not group/other writable, so no process
+#     running as the user can change the closure after it is checked.
+#   * the installed version is one this plugin was tested with, or one the user
+#     explicitly approved as VERSION@SHA256(mtree).
+#
+# Exit status: 0 verified; 210 hermes-agent is not installed; 211 the install
+# does not match its package record; 212 the version is not approved;
+# 213 usage error.
+
+import gzip
+import hashlib
+import io
+import json
+import os
+import pwd
+import re
+import stat
+import sys
+
+PACKAGE = b"hermes-agent"
+INSTALL_ROOT = b"/opt/hermes-agent"
+VENV_PYTHON = b"/opt/hermes-agent/venv/bin/python"
+PYVENV_CFG = b"/opt/hermes-agent/venv/pyvenv.cfg"
+PACMAN_LOCAL = b"/var/lib/pacman/local"
+
+# Versions this plugin release was tested against. Anything else needs an
+# explicit approval from the panel, bound to the exact package build.
+TESTED_VERSIONS = ("0.21.0-1",)
+
+EXIT_MISSING = 210
+EXIT_MISMATCH = 211
+EXIT_UNAPPROVED = 212
+EXIT_USAGE = 213
+
+DESC_LIMIT = 1 << 20
+RECORD_LIMIT = 64 << 20
+HASH_CHUNK = 1 << 20
+APPROVAL_PATTERN = re.compile(r"^[0-9][A-Za-z0-9._+~:-]{0,63}@[0-9a-f]{64}$")
+METADATA_ENTRIES = (b"/.BUILDINFO", b"/.PKGINFO", b"/.INSTALL", b"/.CHANGELOG")
+
+BASE_ENVIRONMENT = (b"LANG", b"LC_ALL", b"XDG_CONFIG_HOME", b"XDG_DATA_HOME",
+                    b"XDG_STATE_HOME", b"XDG_CACHE_HOME", b"XDG_RUNTIME_DIR")
+GUI_ENVIRONMENT = (b"WAYLAND_DISPLAY", b"DISPLAY", b"DBUS_SESSION_BUS_ADDRESS",
+                   b"XDG_CURRENT_DESKTOP", b"XDG_SESSION_TYPE", b"HYPRLAND_INSTANCE_SIGNATURE")
+PATH_VALUED = (b"XDG_CONFIG_HOME", b"XDG_DATA_HOME", b"XDG_STATE_HOME", b"XDG_CACHE_HOME",
+               b"XDG_RUNTIME_DIR")
+
+
+class Refusal(Exception):
+    def __init__(self, code, status, reason, path=None, **extra):
+        Exception.__init__(self, reason)
+        self.code = code
+        self.status = status
+        self.reason = reason
+        self.path = path
+        self.extra = extra
+
+    def as_dict(self):
+        result = {"status": self.status, "reason": self.reason}
+        if self.path is not None:
+            result["path"] = printable(self.path)
+        result.update(self.extra)
+        return result
+
+
+def mismatch(reason, path=None):
+    return Refusal(EXIT_MISMATCH, "mismatch", reason, path)
+
+
+def printable(path):
+    text = path.decode("utf-8", "replace") if isinstance(path, bytes) else str(path)
+    text = "".join(ch if ch.isprintable() else "?" for ch in text)
+    return text if len(text) <= 240 else text[:237] + "..."
+
+
+class Layout:
+    """Where the checked filesystem lives. Tests point `root` at a fake tree
+    and use their own uid/gid; the command line always uses the real root."""
+
+    def __init__(self, root=b"", trusted_uid=0, trusted_gid=0):
+        self.root = root
+        self.trusted_uid = trusted_uid
+        self.trusted_gid = trusted_gid
+
+    def real(self, path):
+        return self.root + path
+
+
+def ancestors(path):
+    parts = [p for p in path.split(b"/") if p]
+    result = [b"/"]
+    for i in range(1, len(parts)):
+        result.append(b"/" + b"/".join(parts[:i]))
+    return result
+
+
+def check_trusted_directory(layout, path):
+    target = layout.real(path) if path != b"/" else (layout.root or b"/")
+    try:
+        st = os.lstat(target)
+    except OSError:
+        raise mismatch("directory is missing", path)
+    if not stat.S_ISDIR(st.st_mode):
+        raise mismatch("expected a directory", path)
+    if st.st_uid != layout.trusted_uid or st.st_gid != layout.trusted_gid:
+        raise mismatch("directory is not owned by root", path)
+    if st.st_mode & 0o022:
+        raise mismatch("directory is writable by group or others", path)
+
+
+def check_trusted_ancestry(layout, path):
+    for directory in ancestors(path):
+        check_trusted_directory(layout, directory)
+
+
+def read_trusted_file(layout, path, limit):
+    try:
+        fd = os.open(layout.real(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        raise mismatch("package record is unreadable", path)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise mismatch("package record is not a regular file", path)
+        if st.st_uid != layout.trusted_uid or st.st_mode & 0o022:
+            raise mismatch("package record is not root-controlled", path)
+        if st.st_size > limit:
+            raise mismatch("package record is too large", path)
+        chunks = []
+        total = 0
+        while total <= limit:
+            chunk = os.read(fd, min(HASH_CHUNK, limit + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > limit:
+            raise mismatch("package record is too large", path)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def parse_desc(data):
+    fields = {}
+    key = None
+    for line in data.split(b"\n"):
+        if line.startswith(b"%") and line.endswith(b"%") and len(line) > 2:
+            key = line[1:-1]
+            fields[key] = []
+        elif line == b"":
+            key = None
+        elif key is not None:
+            fields[key].append(line)
+    return fields
+
+
+def find_package(layout, name):
+    check_trusted_ancestry(layout, PACMAN_LOCAL)
+    check_trusted_directory(layout, PACMAN_LOCAL)
+    try:
+        entries = os.listdir(layout.real(PACMAN_LOCAL))
+    except OSError:
+        raise mismatch("package database is unreadable", PACMAN_LOCAL)
+    matches = []
+    for entry in entries:
+        if not entry.startswith(name + b"-"):
+            continue
+        record = PACMAN_LOCAL + b"/" + entry
+        try:
+            if not stat.S_ISDIR(os.lstat(layout.real(record)).st_mode):
+                continue
+        except OSError:
+            continue
+        check_trusted_directory(layout, record)
+        desc = parse_desc(read_trusted_file(layout, record + b"/desc", DESC_LIMIT))
+        if desc.get(b"NAME") == [name]:
+            matches.append((record, desc))
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise mismatch("more than one database entry for " + name.decode())
+    record, desc = matches[0]
+    version = (desc.get(b"VERSION") or [b""])[0]
+    if not version:
+        raise mismatch("package record has no version", record)
+    return record, desc, version
+
+
+def unescape(value):
+    return re.sub(rb"\\([0-7]{3})", lambda m: bytes([int(m.group(1), 8)]), value)
+
+
+def attributes(tokens):
+    result = {}
+    for token in tokens:
+        key, sep, value = token.partition(b"=")
+        if sep:
+            result[key] = value
+    return result
+
+
+def parse_mtree(compressed):
+    try:
+        data = gzip.GzipFile(fileobj=io.BytesIO(compressed)).read(RECORD_LIMIT + 1)
+    except (OSError, EOFError):
+        raise mismatch("package mtree is not valid gzip")
+    if len(data) > RECORD_LIMIT:
+        raise mismatch("package mtree is too large")
+    defaults = {}
+    entries = []
+    for raw in data.split(b"\n"):
+        line = raw.strip()
+        if not line or line.startswith(b"#"):
+            continue
+        tokens = line.split()
+        if tokens[0] == b"/set":
+            defaults.update(attributes(tokens[1:]))
+            continue
+        if tokens[0] == b"/unset":
+            for token in tokens[1:]:
+                defaults.pop(token.partition(b"=")[0], None)
+            continue
+        if not tokens[0].startswith(b"./"):
+            raise mismatch("unexpected mtree line")
+        path = unescape(tokens[0][1:])
+        if path in METADATA_ENTRIES:
+            continue
+        components = path.split(b"/")[1:]
+        if not components or any(c in (b"", b".", b"..") for c in components):
+            raise mismatch("unsafe path in mtree", path)
+        entry = dict(defaults)
+        entry.update(attributes(tokens[1:]))
+        entries.append((path, entry))
+    return entries
+
+
+def sha256_of(layout, path, expected_stat):
+    try:
+        fd = os.open(layout.real(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        raise mismatch("file is unreadable", path)
+    try:
+        st = os.fstat(fd)
+        if (st.st_ino, st.st_dev) != (expected_stat.st_ino, expected_stat.st_dev):
+            raise mismatch("file changed while it was being checked", path)
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, HASH_CHUNK)
+            if not chunk:
+                break
+            digest.update(chunk)
+        return digest.hexdigest().encode()
+    finally:
+        os.close(fd)
+
+
+def verify_entries(layout, entries):
+    tracked = set()
+    for path, entry in entries:
+        tracked.add(path)
+        kind = entry.get(b"type", b"file")
+        try:
+            st = os.lstat(layout.real(path))
+        except OSError:
+            raise mismatch("packaged file is missing", path)
+        if st.st_uid != layout.trusted_uid or st.st_gid != layout.trusted_gid:
+            raise mismatch("not owned by root", path)
+        if kind == b"link":
+            if not stat.S_ISLNK(st.st_mode):
+                raise mismatch("expected a symlink", path)
+            if os.readlink(layout.real(path)) != unescape(entry.get(b"link", b"")):
+                raise mismatch("symlink target differs from the package", path)
+            continue
+        if kind == b"dir":
+            if not stat.S_ISDIR(st.st_mode):
+                raise mismatch("expected a directory", path)
+        elif kind == b"file":
+            if not stat.S_ISREG(st.st_mode):
+                raise mismatch("expected a regular file", path)
+        else:
+            raise mismatch("unsupported entry type in package", path)
+        try:
+            mode = int(entry.get(b"mode", b""), 8)
+        except ValueError:
+            raise mismatch("package record has no mode", path)
+        if (st.st_mode & 0o7777) != mode:
+            raise mismatch("permissions differ from the package", path)
+        if st.st_mode & 0o022:
+            raise mismatch("writable by group or others", path)
+        if kind == b"file":
+            if b"size" in entry and st.st_size != int(entry[b"size"]):
+                raise mismatch("size differs from the package", path)
+            expected = entry.get(b"sha256digest")
+            if not expected:
+                raise mismatch("package record has no checksum", path)
+            if sha256_of(layout, path, st) != expected:
+                raise mismatch("contents differ from the package", path)
+    return tracked
+
+
+def allowed_untracked(layout, path, st):
+    if st.st_uid != layout.trusted_uid or st.st_gid != layout.trusted_gid or st.st_mode & 0o022:
+        return False
+    parent, _, name = path.rpartition(b"/")
+    if stat.S_ISDIR(st.st_mode):
+        return name == b"__pycache__"
+    return (stat.S_ISREG(st.st_mode) and name.endswith(b".pyc")
+            and parent.rpartition(b"/")[2] == b"__pycache__")
+
+
+def reject_untracked(layout, top, tracked, skip=()):
+    stack = [top]
+    while stack:
+        directory = stack.pop()
+        try:
+            iterator = os.scandir(layout.real(directory))
+        except OSError:
+            raise mismatch("directory is unreadable", directory)
+        with iterator:
+            for item in iterator:
+                path = directory + b"/" + item.name
+                if path in skip:
+                    continue
+                st = item.stat(follow_symlinks=False)
+                if path not in tracked and not allowed_untracked(layout, path, st):
+                    raise mismatch("not part of the package", path)
+                if stat.S_ISDIR(st.st_mode):
+                    stack.append(path)
+
+
+def interpreter_package(layout, hermes_desc, hermes_entries):
+    links = dict((p, e) for p, e in hermes_entries if e.get(b"type") == b"link")
+    if VENV_PYTHON not in links:
+        raise mismatch("the package does not provide the venv interpreter", VENV_PYTHON)
+    target = unescape(links[VENV_PYTHON].get(b"link", b""))
+    if not re.match(rb"^/usr/bin/python3\.[0-9]{1,2}$", target):
+        raise mismatch("the venv interpreter is not a system python", target)
+    relative = target[1:]
+    for dependency in hermes_desc.get(b"DEPENDS", []):
+        name = re.split(rb"[<>=:]", dependency, 1)[0]
+        if not re.match(rb"^[A-Za-z0-9@._+-]+$", name):
+            continue
+        found = find_package(layout, name)
+        if found is None:
+            continue
+        record, _desc, version = found
+        files = read_trusted_file(layout, record + b"/files", RECORD_LIMIT)
+        if relative in files.split(b"\n"):
+            return name, version, record, target
+    raise mismatch("the venv interpreter is not owned by a dependency of hermes-agent", target)
+
+
+def check_pyvenv(layout):
+    config = read_trusted_file(layout, PYVENV_CFG, DESC_LIMIT)
+    values = {}
+    for line in config.split(b"\n"):
+        key, sep, value = line.partition(b"=")
+        if sep:
+            values[key.strip()] = value.strip()
+    if values.get(b"include-system-site-packages", b"").lower() != b"false":
+        raise mismatch("the venv includes system site-packages", PYVENV_CFG)
+
+
+def verify(layout, approvals):
+    found = find_package(layout, PACKAGE)
+    if found is None:
+        raise Refusal(EXIT_MISSING, "missing", "hermes-agent is not installed with pacman")
+    record, desc, version = found
+    mtree_bytes = read_trusted_file(layout, record + b"/mtree", RECORD_LIMIT)
+    mtree_sha = hashlib.sha256(mtree_bytes).hexdigest()
+    entries = parse_mtree(mtree_bytes)
+
+    check_trusted_ancestry(layout, INSTALL_ROOT)
+    tracked = verify_entries(layout, entries)
+    if INSTALL_ROOT not in tracked:
+        raise mismatch("the package does not own the install directory", INSTALL_ROOT)
+    check_pyvenv(layout)
+
+    runtime_name, runtime_version, runtime_record, interpreter = interpreter_package(layout, desc, entries)
+    stdlib = b"/usr/lib/" + interpreter.rpartition(b"/")[2]
+    check_trusted_ancestry(layout, interpreter)
+    check_trusted_ancestry(layout, stdlib)
+    runtime_entries = parse_mtree(read_trusted_file(layout, runtime_record + b"/mtree", RECORD_LIMIT))
+    runtime_tracked = verify_entries(layout, runtime_entries)
+    if interpreter not in runtime_tracked or stdlib not in runtime_tracked:
+        raise mismatch("the interpreter package does not own its standard library", stdlib)
+
+    reject_untracked(layout, INSTALL_ROOT, tracked)
+    reject_untracked(layout, stdlib, runtime_tracked, skip=(stdlib + b"/site-packages",))
+
+    version_text = version.decode("ascii", "replace")
+    approval = version_text + "@" + mtree_sha
+    if version_text not in TESTED_VERSIONS and approval not in approvals:
+        raise Refusal(EXIT_UNAPPROVED, "unapproved",
+                      "hermes-agent " + version_text + " has not been approved for Hermes Chat",
+                      version=version_text, mtree=mtree_sha, approval=approval,
+                      tested=list(TESTED_VERSIONS))
+    return {
+        "status": "ok",
+        "version": version_text,
+        "mtree": mtree_sha,
+        "approval": approval,
+        "tested": version_text in TESTED_VERSIONS,
+        "runtime": runtime_name.decode() + " " + runtime_version.decode("ascii", "replace"),
+        "files": len(tracked) + len(runtime_tracked),
+    }
+
+
+def sane_value(name, value):
+    if not value or len(value) > 4096 or re.search(rb"[\x00-\x1f\x7f]", value):
+        return False
+    if name in PATH_VALUED:
+        return value.startswith(b"/") and b"/../" not in value + b"/"
+    return True
+
+
+def hermes_environment(gui, raw_environment):
+    account = pwd.getpwuid(os.geteuid())
+    environment = {
+        b"HOME": os.fsencode(account.pw_dir),
+        b"USER": os.fsencode(account.pw_name),
+        b"LOGNAME": os.fsencode(account.pw_name),
+        b"PATH": b"/usr/bin:/bin",
+        b"TERM": b"dumb",
+        b"LANG": b"C.UTF-8",
+        # Seal the venv: no lazy pip installs, and no durable install target
+        # (HERMES_LAZY_INSTALL_TARGET stays unset, so nothing under $HOME is
+        # appended to sys.path).
+        b"HERMES_DISABLE_LAZY_INSTALLS": b"1",
+    }
+    names = BASE_ENVIRONMENT + (GUI_ENVIRONMENT if gui else ())
+    for name in names:
+        value = raw_environment.get(name)
+        if value is not None and sane_value(name, value):
+            environment[name] = value
+    return environment
+
+
+def exec_environment_source():
+    with open("/proc/self/environ", "rb") as handle:
+        raw = handle.read(1 << 20)
+    result = {}
+    for entry in raw.split(b"\0"):
+        name, sep, value = entry.partition(b"=")
+        if sep and name:
+            result[name] = value
+    return result
+
+
+def usage():
+    sys.stderr.write("usage: hermes-verify check [--approve VER@MTREE]... | "
+                     "exec [--gui] [--approve VER@MTREE]... -- chat|desktop [args...]\n")
+    os._exit(EXIT_USAGE)
+
+
+def main(argv):
+    if not argv or argv[0] not in ("check", "exec"):
+        usage()
+    mode = argv[0]
+    approvals = set()
+    gui = False
+    rest = []
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--approve" and i + 1 < len(argv) and APPROVAL_PATTERN.match(argv[i + 1]):
+            approvals.add(argv[i + 1])
+            i += 2
+        elif arg == "--gui" and mode == "exec":
+            gui = True
+            i += 1
+        elif arg == "--" and mode == "exec":
+            rest = argv[i + 1:]
+            break
+        else:
+            usage()
+    if mode == "exec" and (not rest or rest[0] not in ("chat", "desktop")):
+        usage()
+
+    try:
+        info = verify(Layout(), approvals)
+    except Refusal as refusal:
+        text = json.dumps(refusal.as_dict(), sort_keys=True)
+        if mode == "check":
+            sys.stdout.write(text + "\n")
+        else:
+            sys.stderr.write("Hermes Chat refused to start Hermes: " + refusal.reason
+                             + (" (" + printable(refusal.path) + ")" if refusal.path else "") + "\n")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(refusal.code)
+
+    if mode == "check":
+        sys.stdout.write(json.dumps(info, sort_keys=True) + "\n")
+        sys.stdout.flush()
+        os._exit(0)
+
+    argv0 = VENV_PYTHON
+    os.execve(argv0, [argv0, b"-I", b"-B", b"-m", b"hermes_cli.main"] + [os.fsencode(a) for a in rest],
+              hermes_environment(gui, exec_environment_source()))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

@@ -5,79 +5,78 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import "Hermes.js" as Hermes
 
-// Bar icon + dropdown for talking to the local `hermes` CLI without opening
+// Bar icon + dropdown for talking to the local Hermes agent without opening
 // the Hermes desktop app. Each send runs `hermes chat -Q --oneshot
-// --query-file -` (one-shot mode, message piped over stdin rather than
-// argv) as its own child process, in its own process group — there is no
-// daemon here, matching the CLI's own model where a one-shot turn doesn't
-// require the persistent gateway. `-c`/`--continue` is added on every send
-// except the one right after "New chat", so quick chat naturally continues
-// whatever Hermes conversation is currently most recent (there's no way for
-// a plugin outside the desktop app to know which *GUI* session has focus,
-// so "most recent" is the closest available stand-in).
+// --query-file -` (one-shot mode, message piped over stdin rather than argv)
+// as its own child process tree — there is no daemon here, matching the CLI's
+// own model where a one-shot turn doesn't require the persistent gateway.
+// `-c`/`--continue` is added on every send except the one right after "New
+// chat", so quick chat naturally continues whatever Hermes conversation is
+// currently most recent.
 //
-// One-shot turns can take anywhere from a few seconds to tens of seconds
-// (model + tool-loop latency) — the panel shows a busy state and lets you
-// keep using the rest of your desktop while it runs.
+// Trust boundary (see README "Security model" and Hermes.js):
+//   - Hermes is never looked up on PATH. bin/hermes-verify accepts only the
+//     pacman-installed hermes-agent, checks its whole runtime closure against
+//     pacman's record immediately before every use, and then execs the venv
+//     interpreter itself. Drift, extra files, or an unapproved version fail
+//     closed.
+//   - No shell anywhere: every command is an argv vector starting with a fixed
+//     absolute path, run under bin/bounded-run (output caps, deadline,
+//     race-free process-group teardown), with a cleared environment.
+//   - The state file is only touched by bin/hermes-state, through held
+//     directory descriptors, over stdin/stdout.
 Panel {
   id: root
   moduleName: "tim.hermes-chat"
   ipcTarget: "tim.hermes-chat"
   manageIpc: false
 
-  readonly property string home: Quickshell.env("HOME")
-  // Quickshell instantiates this whole component once PER MONITOR (a bar
-  // surface is built per screen), so root.transcript etc. are otherwise
-  // separate, unsynced copies of state per screen. Persisting to this file
-  // and re-reading it every time the panel opens is what makes "whichever
-  // monitor you open it on" show the same conversation.
-  readonly property string statePath: root.home + "/.local/state/omarchy/hermes-chat/state.json"
-  readonly property string legacyNotifyPath: root.home + "/.local/state/omarchy/hermes-chat/notify"
+  readonly property string pluginDir: Hermes.pluginDirFromUrl(Qt.resolvedUrl("."))
+  // Environments for child processes, in place of the shell's own: a fixed
+  // PATH plus an allow-list of single-line session variables (Hermes.js).
+  readonly property var processEnvironment: Hermes.environment(function(name) { return Quickshell.env(name) }, false)
+  readonly property var sessionEnvironment: Hermes.environment(function(name) { return Quickshell.env(name) }, true)
 
-  property bool hermesAvailable: true
+  // "checking" | "ok" | "missing" | "mismatch" | "unapproved" | "error"
+  property string verifyStatus: "checking"
+  property var verifyInfo: ({})
+  readonly property bool hermesAvailable: verifyStatus === "ok"
+  property bool _verifyAgain: false
+  property bool _initialVerifyDone: false
+  property string _verifyStdout: ""
+
   property bool busy: false
   property bool freshChatPending: false
   property string draft: ""
   property string errorText: ""
   property bool notifyOnAnswers: false
   property var transcript: [] // [{ role: "user"|"assistant", text }]
+  // hermes-agent builds the user explicitly trusted, as "VERSION@SHA256(mtree)".
+  property var approvedHermes: []
   property string _stdout: ""
   property string _stderr: ""
+  property string _stateStdout: ""
+  property string _stateStderr: ""
+  property string _writeStderr: ""
+  // Nothing is written until the state file has been read once, so a write
+  // can never replace saved approvals/preferences with defaults.
+  property bool _stateLoaded: false
   // Latest state payload waiting for stateWriteProcess to be free (see
   // flushState()); only the newest matters, so later writes replace it.
   property string _pendingState: ""
-  // Resolved once at startup to absolute paths (falls back to the bare name
-  // if resolution fails) so command spawning doesn't trust whatever
-  // happens to be first on $PATH — matches nostr-signer's convention of
-  // pinning an absolute binary path rather than relying on PATH lookup.
-  property var bin: ({
-    hermes: "hermes", bash: "bash", notifySend: "notify-send",
-    hyprctl: "hyprctl", pgrep: "pgrep", setsid: "setsid"
-  })
   readonly property int maxReplyChars: 4000
-  // Byte caps on the chat subprocess's stdout/stderr, enforced *producer
-  // side* in the wrapper script below (see sendMessage()): each stream is
-  // piped through `head -c` in the spawned shell, so at most this many bytes
-  // ever reach Quickshell's StdioCollector, regardless of how much or how
-  // fast the job writes. The first byte past the cap kills the whole job's
-  // process group and makes the wrapper exit with a distinct status
-  // (excessStdoutExit / excessStderrExit) so the panel can say why.
-  readonly property int maxStdoutBytes: 262144
-  readonly property int maxStderrBytes: 65536
-  readonly property int excessStdoutExit: 201
-  readonly property int excessStderrExit: 202
+  // Byte caps on the chat job's stdout/stderr are enforced producer-side by
+  // bin/bounded-run (Hermes.chatStdoutBytes / chatStderrBytes): at most that
+  // many bytes ever reach Quickshell, and the first byte past a cap tears the
+  // whole job down with exit 201 / 202.
   // Soft deadline passed to `hermes --run-budget`: the agent gets a wrap-up
   // nudge at 80% elapsed and tries to land a response before this. The hard
-  // deadline below is the actual enforcement — this just makes a clean
-  // finish more likely before that kicks in.
+  // deadline below is the actual enforcement.
   readonly property int chatRunBudgetSeconds: 240
-  // Hard local deadline: if the job hasn't exited by here, it's killed
-  // regardless of what --run-budget did or didn't manage on its own.
+  // Hard local deadline: if the job hasn't exited by here, it's stopped.
   readonly property int chatHardTimeoutSeconds: 300
-  // Grace window between TERM and KILL when stopping a chat job — same
-  // window the process-group wrapper below uses internally.
-  readonly property int killGraceSeconds: 3
   // Set right before killChatProcess() signals the job, so onExited can show
   // *why* it ended instead of a bare "hermes exited with code N".
   property string _killReason: ""
@@ -86,49 +85,80 @@ Panel {
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.5)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
-  readonly property color barIconColor: !hermesAvailable ? urgent : foreground
+  readonly property color barIconColor: !hermesAvailable && verifyStatus !== "checking" ? urgent : foreground
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  function resolveBinaries() {
-    // `command -v` falls back to echoing the bare name itself when a
-    // binary isn't found, so this always emits exactly 6 lines.
-    resolveBinsProcess.command = ["bash", "-c",
-      "for b in hermes bash notify-send hyprctl pgrep setsid; do command -v \"$b\" 2>/dev/null || echo \"$b\"; done"
-    ]
-    resolveBinsProcess.running = true
+  function verifyHermes() {
+    if (verifyProcess.running) {
+      root._verifyAgain = true
+      return
+    }
+    var command = Hermes.verifyCommand(root.pluginDir, root.approvedHermes)
+    if (command.length === 0) {
+      root.verifyStatus = "error"
+      root.verifyInfo = { reason: "The plugin's install path isn't usable." }
+      return
+    }
+    root.verifyStatus = "checking"
+    root._verifyStdout = ""
+    verifyProcess.command = command
+    verifyProcess.running = true
   }
 
-  function applyResolvedBinaries(text) {
-    var lines = String(text || "").trim().split("\n")
-    if (lines.length === 6) {
-      root.bin = {
-        hermes: lines[0], bash: lines[1], notifySend: lines[2],
-        hyprctl: lines[3], pgrep: lines[4], setsid: lines[5]
-      }
-    } // else: resolution failed oddly; keep the bare-name fallbacks
-    root.checkHermesAvailable()
-    root.readState()
+  function applyVerifyResult(exitCode) {
+    var result = Hermes.parseVerifyOutput(root._verifyStdout)
+    var expected = {}
+    expected[0] = "ok"
+    expected[Hermes.exitCodes.hermesMissing] = "missing"
+    expected[Hermes.exitCodes.hermesMismatch] = "mismatch"
+    expected[Hermes.exitCodes.hermesUnapproved] = "unapproved"
+    if (expected[exitCode] !== undefined && result.status === expected[exitCode]) {
+      root.verifyInfo = result
+      root.verifyStatus = result.status
+    } else {
+      root.verifyInfo = { reason: "the verifier exited with code " + exitCode + "." }
+      root.verifyStatus = "error"
+    }
   }
 
-  function checkHermesAvailable() {
-    versionProcess.command = [root.bin.hermes, "--version"]
-    versionProcess.running = true
+  function approveInstalledHermes() {
+    var approval = root.verifyInfo.approval || ""
+    if (root.verifyStatus !== "unapproved" || !approval) return
+    root.approvedHermes = Hermes.sanitizeApprovals([approval].concat(root.approvedHermes))
+    root.writeState()
+    root.verifyHermes()
   }
 
-  // Reads state.json if present; otherwise seeds notifyOnAnswers from the
-  // old single-purpose prefs file so upgrading from an earlier version of
-  // this plugin doesn't silently reset a preference you already set.
-  // `head -c` caps how much JSON.parse ever has to look at, regardless of
-  // how large the file on disk is.
+  function unavailableMessage() {
+    var info = root.verifyInfo || {}
+    if (root.verifyStatus === "missing")
+      return "Hermes Chat only runs the pacman-installed hermes-agent package, and it isn't installed. Install hermes-agent, then Re-check."
+    if (root.verifyStatus === "mismatch")
+      return "Your hermes-agent install doesn't match its pacman package record, so Hermes Chat won't run it: "
+        + (info.reason || "unknown difference") + (info.path ? " (" + info.path + ")" : "")
+        + ". Restore the package's files and root ownership (`pacman -Qkk hermes-agent` lists what differs) and remove anything added under /opt/hermes-agent, then Re-check."
+    if (root.verifyStatus === "unapproved")
+      return "hermes-agent " + (info.version || "?") + " is installed and matches its package record, but this Hermes Chat release was tested with "
+        + (info.tested || "a different version") + ". Trusting it lets that exact package build handle your messages."
+    return "Couldn't verify the Hermes install: " + (info.reason || "unknown error")
+  }
+
+  // Reads state.json through bin/hermes-state (which also carries over the
+  // notify preference from the plugin's older prefs file). The helper caps
+  // what it reads at 1 MiB and refuses anything that isn't the user's own
+  // private regular file.
   function readState() {
-    stateReadProcess.command = [root.bin.bash, "-c",
-      "if [ -f \"$0\" ]; then head -c 1048576 \"$0\"; " +
-      "elif [ \"$(cat \"$1\" 2>/dev/null)\" = \"1\" ]; then printf '{\"notifyOnAnswers\":true}'; " +
-      "else printf '{}'; fi",
-      root.statePath, root.legacyNotifyPath
-    ]
+    if (stateReadProcess.running) return
+    var command = Hermes.stateReadCommand(root.pluginDir)
+    if (command.length === 0) {
+      root.errorText = "Couldn't load chat state: the plugin's install path isn't usable."
+      return
+    }
+    root._stateStdout = ""
+    root._stateStderr = ""
+    stateReadProcess.command = command
     stateReadProcess.running = true
   }
 
@@ -136,7 +166,8 @@ Panel {
     root._pendingState = JSON.stringify({
       transcript: root.transcript,
       freshChatPending: root.freshChatPending,
-      notifyOnAnswers: root.notifyOnAnswers
+      notifyOnAnswers: root.notifyOnAnswers,
+      approvedHermes: root.approvedHermes
     })
     root.flushState()
   }
@@ -147,30 +178,16 @@ Panel {
   // write() goes to the *current* process, so without this guard two quick
   // writes would push the second payload into the first writer's stdin.
   function flushState() {
-    if (stateWriteProcess.running || !root._pendingState) return
+    if (!root._stateLoaded || stateWriteProcess.running || !root._pendingState) return
+    var command = Hermes.stateWriteCommand(root.pluginDir)
+    if (command.length === 0) return
     var payload = root._pendingState
     root._pendingState = ""
-    // The payload — which is the whole conversation transcript — is piped
-    // to the writer over stdin, never passed as an argv value, so prompts
-    // and model output don't sit in /proc/<pid>/cmdline for the life of the
-    // write. The only argv is the (non-secret) destination path.
-    //
-    // Write via a same-directory temp file + rename rather than a direct
-    // `> "$0"` redirect: a redirect follows a symlink planted at that path
-    // (predictable, in a dir the plugin itself created) straight through
-    // to whatever it points at, and there'd be a window before chmod where
-    // the file sits at the default umask. mktemp creates its file at 0600
-    // up front (chmod is redundant but explicit), and mv on the same
-    // filesystem is a rename(2), which replaces the destination directory
-    // entry atomically instead of writing through it — so a symlink at the
-    // final path gets replaced, never followed. `head -c` bounds what the
-    // writer will ever accept, mirroring the cap on the read side.
-    stateWriteProcess.command = [root.bin.bash, "-c",
-      "set -e; d=\"$(dirname \"$0\")\"; mkdir -p \"$d\"; chmod 700 \"$d\"; " +
-      "tmp=\"$(mktemp \"$d/.state.json.XXXXXX\")\"; chmod 600 \"$tmp\"; " +
-      "if head -c 1048576 > \"$tmp\"; then mv -f \"$tmp\" \"$0\"; else rm -f \"$tmp\"; exit 1; fi",
-      root.statePath
-    ]
+    root._writeStderr = ""
+    // The payload — the whole conversation transcript — goes to the writer
+    // over stdin, never argv, so prompts and replies don't sit in
+    // /proc/<pid>/cmdline. The writer's argv is fixed.
+    stateWriteProcess.command = command
     stateWriteProcess.running = true
     stateWriteProcess.write(payload)
     stateWriteProcess.stdinEnabled = false
@@ -182,10 +199,14 @@ Panel {
   function applyState(text) {
     var parsed = {}
     try { parsed = JSON.parse(text || "{}") || {} } catch (e) { parsed = {} }
-    root.transcript = Array.isArray(parsed.transcript) ? parsed.transcript : []
+    if (typeof parsed !== "object" || Array.isArray(parsed)) parsed = {}
+    root.transcript = Hermes.sanitizeTranscript(parsed.transcript)
     root.freshChatPending = !!parsed.freshChatPending
     root.notifyOnAnswers = !!parsed.notifyOnAnswers
+    root.approvedHermes = Hermes.sanitizeApprovals(parsed.approvedHermes)
+    root._stateLoaded = true
     root.scrollToLatest()
+    root.flushState()
   }
 
   function appendTranscript(entry) {
@@ -197,9 +218,7 @@ Panel {
 
   // Jumps the transcript scroll area to the newest message. Qt.callLater
   // defers this past the Repeater/Column relayout that follows a
-  // transcript change, so contentHeight is already current when this runs
-  // — calling it synchronously would scroll to where the *old* content
-  // ended, one message behind.
+  // transcript change, so contentHeight is already current when this runs.
   function scrollToLatest() {
     Qt.callLater(function() {
       transcriptFlick.contentY = Math.max(0, transcriptFlick.contentHeight - transcriptFlick.height)
@@ -213,20 +232,21 @@ Panel {
 
   function sendMessage() {
     var text = root.draft.trim()
-    if (!text || root.busy) return
+    if (!text || root.busy || !root.hermesAvailable) return
+
+    // bin/hermes-verify re-verifies the install and then execs Hermes with
+    // `chat -Q --oneshot --query-file -`: the message is written to stdin
+    // below, never to argv.
+    var command = Hermes.chatCommand(root.pluginDir, root.approvedHermes,
+      root.chatRunBudgetSeconds, root.chatHardTimeoutSeconds, !root.freshChatPending)
+    if (command.length === 0) {
+      root.errorText = "Couldn't start Hermes: the plugin's install path isn't usable."
+      return
+    }
 
     root.errorText = ""
     root.appendTranscript({ role: "user", text: text })
     root.draft = ""
-
-    // `hermes chat --query-file -` reads the message from stdin instead of
-    // argv, so the full text (pasted secrets included) never shows up in
-    // `ps`/`/proc/<pid>/cmdline` for the life of the request. `-Q --oneshot`
-    // reproduces the old top-level `-z`'s contract of "stdout carries only
-    // the final response text" (session id / warnings go to stderr).
-    var hermesArgs = [root.bin.hermes, "chat", "-Q", "--oneshot", "--query-file", "-",
-      "--run-budget", String(root.chatRunBudgetSeconds)]
-    if (!root.freshChatPending) hermesArgs.push("-c")
     root.freshChatPending = false
     root.writeState()
 
@@ -235,39 +255,8 @@ Panel {
     root._stderr = ""
     root._killReason = ""
 
-    // Run the real command in its own process group (`set -m` job control
-    // makes the backgrounded job's pgid its own pid) so a TERM sent to that
-    // group reaches every descendant Hermes' tool loop spawned, not just the
-    // immediate child. The trap self-escalates to KILL after a grace period,
-    // entirely inside this spawned shell — that cleanup runs to completion
-    // even if this plugin/panel is gone by the time it fires.
-    //
-    // The job's stdout and stderr each go through a `limit` process
-    // substitution rather than straight to Quickshell: `head -c N` forwards
-    // at most N bytes, and if even one more byte follows, the limiter sends
-    // USR1 (stdout) or USR2 (stderr) back to this wrapper, which kills the
-    // job's whole group and exits with a distinct code. So the caps are
-    // enforced where the bytes are produced — the shell only ever receives
-    // a bounded buffer, and never has to react after the fact. The
-    // wrapper's own argv carries only these numbers and the hermes flags;
-    // the message itself is written to stdin below.
-    var script = "set -m; maxout=$1; maxerr=$2; grace=$3; shift 3; pid=''; excess=0; " +
-      "limit() { head -c \"$1\"; if [ \"$(head -c 1 | wc -c)\" -gt 0 ]; then kill -\"$2\" \"$$\" 2>/dev/null; fi; }; " +
-      "stop() { if [ -n \"$pid\" ]; then kill -TERM -- \"-$pid\" 2>/dev/null; sleep \"$grace\"; kill -KILL -- \"-$pid\" 2>/dev/null; fi; }; " +
-      "trap 'stop' TERM; " +
-      "trap 'excess=" + root.excessStdoutExit + "; stop' USR1; " +
-      "trap 'excess=" + root.excessStderrExit + "; stop' USR2; " +
-      "exec {out}> >(limit \"$maxout\" USR1); outpid=$!; " +
-      "exec {err}> >(limit \"$maxerr\" USR2 >&2); errpid=$!; " +
-      "\"$@\" >&\"$out\" 2>&\"$err\" & pid=$!; " +
-      "exec {out}>&- {err}>&-; " +
-      "wait \"$pid\"; rc=$?; wait \"$outpid\" \"$errpid\" 2>/dev/null; " +
-      "if [ \"$excess\" -ne 0 ]; then exit \"$excess\"; fi; exit \"$rc\""
-    chatProcess.command = [root.bin.bash, "-c", script, "--",
-      String(root.maxStdoutBytes), String(root.maxStderrBytes), String(root.killGraceSeconds)
-    ].concat(hermesArgs)
+    chatProcess.command = command
     chatProcess.running = true
-    // Written to the child's stdin, never to argv — see the comment above.
     chatProcess.write(text)
     chatProcess.stdinEnabled = false
     // Re-arm for the next send: stdinEnabled=false closes the channel for
@@ -276,10 +265,9 @@ Panel {
     chatDeadlineTimer.restart()
   }
 
-  // Sends TERM to the whole job (see the wrapper script in sendMessage()),
-  // which self-escalates to KILL if the group hasn't exited within
-  // killGraceSeconds. Used by the Stop button, the hard deadline, and
-  // panel/plugin teardown.
+  // TERM to the supervisor, which tears down the whole job — every
+  // descendant, TERM then KILL after its grace window — before it exits.
+  // Used by the Stop button, the hard deadline, and panel/plugin teardown.
   function killChatProcess(reason) {
     if (!chatProcess.running) return
     root._killReason = reason
@@ -294,61 +282,84 @@ Panel {
     root.writeState()
   }
 
+  // Focuses the Hermes window if it's open, otherwise launches the desktop
+  // app through the same verified path as chat.
   function showFullApp() {
     haptic()
-    focusProcess.command = [root.bin.bash, "-c",
-      "if \"$0\" -f 'apps/desktop/release/linux-unpacked/Hermes$' >/dev/null 2>&1; then " +
-      "\"$1\" dispatch focuswindow 'class:^(Hermes)$' >/dev/null 2>&1; " +
-      "else \"$2\" -f \"$3\" desktop --skip-build >/dev/null 2>&1; fi",
-      root.bin.pgrep, root.bin.hyprctl, root.bin.setsid, root.bin.hermes
-    ]
-    focusProcess.running = true
+    if (!root.hermesAvailable) {
+      root.errorText = "The desktop app can't be opened from here until the Hermes install verifies."
+      return
+    }
+    var command = Hermes.desktopRunningCommand(root.pluginDir)
+    if (command.length === 0 || desktopProbeProcess.running) return
+    desktopProbeProcess.command = command
+    desktopProbeProcess.running = true
     root.close()
   }
 
   // No haptics service is wired into this base kit the way the Hermes
-  // desktop SDK has one — left as a no-op seam so it's obvious where one
-  // would plug in if this shell grows a haptics/sound hook later.
+  // desktop SDK has one — left as a no-op seam.
   function haptic() {}
 
   // Re-read on every open (not just once at startup) so switching monitors
   // — a genuinely different component instance — picks up whatever the
   // last-used monitor's instance wrote.
-  onOpenedChanged: if (opened) { root.errorText = ""; root.readState() }
+  onOpenedChanged: if (opened) {
+    root.errorText = ""
+    root.readState()
+    if (root._initialVerifyDone && root.verifyStatus !== "ok" && root.verifyStatus !== "checking") root.verifyHermes()
+  }
 
-  Component.onCompleted: root.resolveBinaries()
-  // Panel/plugin teardown: fire TERM at whatever chat job is still running.
-  // The wrapper's own trap escalates to KILL on its own timeline (see
-  // sendMessage()), so that cleanup still runs to completion even though
-  // this component and its Timers are being destroyed right now.
+  Component.onCompleted: root.readState()
+  // Panel/plugin teardown: TERM the supervisor; it finishes tearing the job
+  // down on its own (and also receives TERM if the shell itself dies).
   Component.onDestruction: if (chatProcess.running) chatProcess.signal(15)
 
   Process {
-    id: resolveBinsProcess
+    id: verifyProcess
     running: false
     command: []
+    clearEnvironment: true
+    environment: root.processEnvironment
     stdout: StdioCollector {
-      id: resolveBinsStdout
       waitForEnd: true
-      onStreamFinished: root.applyResolvedBinaries(text)
+      onStreamFinished: root._verifyStdout = text
     }
-  }
-
-  Process {
-    id: versionProcess
-    running: false
-    command: []
-    onExited: function(exitCode) { root.hermesAvailable = (exitCode === 0) }
+    onExited: function(exitCode) {
+      root.applyVerifyResult(exitCode)
+      if (root._verifyAgain) {
+        root._verifyAgain = false
+        root.verifyHermes()
+      }
+    }
   }
 
   Process {
     id: stateReadProcess
     running: false
     command: []
+    clearEnvironment: true
+    environment: root.processEnvironment
     stdout: StdioCollector {
-      id: stateReadStdout
       waitForEnd: true
-      onStreamFinished: root.applyState(text)
+      onStreamFinished: root._stateStdout = text
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root._stateStderr = text
+    }
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        root.applyState(root._stateStdout)
+      } else {
+        root.errorText = Hermes.boundedText(root._stateStderr.trim(), 400)
+          || ("Couldn't load chat state (exit " + exitCode + ").")
+      }
+      root._stateStdout = ""
+      if (!root._initialVerifyDone) {
+        root._initialVerifyDone = true
+        root.verifyHermes()
+      }
     }
   }
 
@@ -357,13 +368,54 @@ Panel {
     running: false
     command: []
     stdinEnabled: true
-    onExited: root.flushState()
+    clearEnvironment: true
+    environment: root.processEnvironment
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root._writeStderr = text
+    }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        root.errorText = Hermes.boundedText(root._writeStderr.trim(), 400)
+          || ("Couldn't save chat state (exit " + exitCode + ").")
+      }
+      root.flushState()
+    }
+  }
+
+  Process {
+    id: desktopProbeProcess
+    running: false
+    command: []
+    clearEnvironment: true
+    environment: root.processEnvironment
+    onExited: function(exitCode) {
+      // pgrep: 0 = the desktop app is running, 1 = it isn't. Anything else
+      // (including 127 when pgrep isn't installed) leaves the feature inert.
+      if (exitCode === 0) {
+        focusProcess.command = Hermes.focusDesktopCommand(root.pluginDir)
+        focusProcess.running = true
+      } else if (exitCode === 1) {
+        desktopLaunchProcess.command = Hermes.desktopCommand(root.pluginDir, root.approvedHermes)
+        if (desktopLaunchProcess.command.length > 0) desktopLaunchProcess.startDetached()
+      }
+    }
   }
 
   Process {
     id: focusProcess
     running: false
     command: []
+    clearEnvironment: true
+    environment: root.sessionEnvironment
+  }
+
+  Process {
+    id: desktopLaunchProcess
+    running: false
+    command: []
+    clearEnvironment: true
+    environment: root.sessionEnvironment
   }
 
   Process {
@@ -371,10 +423,10 @@ Panel {
     running: false
     command: []
     stdinEnabled: true
-    // Both collectors only ever see a bounded stream: the wrapper script in
-    // sendMessage() caps each one producer-side (maxStdoutBytes /
-    // maxStderrBytes) and kills the job on the first excess byte, so there's
-    // nothing to police here — waitForEnd just hands over the bounded text.
+    clearEnvironment: true
+    environment: root.processEnvironment
+    // Both collectors only ever see a bounded stream: bin/bounded-run caps
+    // each one producer-side and stops the job on the first excess byte.
     stdout: StdioCollector {
       id: chatStdout
       waitForEnd: true
@@ -394,12 +446,23 @@ Panel {
         root._killReason = ""
         return
       }
-      if (exitCode === root.excessStdoutExit) {
+      if (exitCode === Hermes.exitCodes.stdoutCap) {
         root.errorText = "Hermes produced too much output and was stopped."
         return
       }
-      if (exitCode === root.excessStderrExit) {
+      if (exitCode === Hermes.exitCodes.stderrCap) {
         root.errorText = "Hermes produced too much error output and was stopped."
+        return
+      }
+      if (exitCode === Hermes.exitCodes.timeout) {
+        root.errorText = "Hermes didn't respond within " + root.chatHardTimeoutSeconds + "s and was stopped."
+        return
+      }
+      if (exitCode === Hermes.exitCodes.hermesMissing || exitCode === Hermes.exitCodes.hermesMismatch
+          || exitCode === Hermes.exitCodes.hermesUnapproved) {
+        // The install changed since the last check: refuse and re-check.
+        root.errorText = Hermes.boundedText(root._stderr.trim(), 400) || "Hermes Chat refused to start Hermes."
+        root.verifyHermes()
         return
       }
       if (exitCode === 0) {
@@ -409,17 +472,14 @@ Panel {
           : full
         root.appendTranscript({ role: "assistant", text: reply })
         root.writeState()
-        if (root.notifyOnAnswers && !root.opened) {
-          notifyProcess.command = [root.bin.notifySend, "-a", "Hermes", "Hermes replied", reply.slice(0, 200)]
+        if (root.notifyOnAnswers && !root.opened && !notifyProcess.running) {
+          notifyProcess.command = Hermes.notifyCommand(root.pluginDir)
           notifyProcess.running = true
         }
       } else {
-        // Unlike the old top-level `-z` (which redirected the whole run's
-        // stdout to devnull and only printed the final response at the
-        // very end), some `hermes chat` failure paths — e.g. an exhausted
-        // HTTP retry loop — print their message to stdout rather than
-        // stderr even under -Q. Check both so a real error doesn't get
-        // swallowed in favor of a bare "session_id: ..." line on stderr.
+        // Some `hermes chat` failure paths print their message to stdout
+        // rather than stderr even under -Q. Check both so a real error
+        // doesn't get swallowed in favor of a bare "session_id: ..." line.
         var errText = [root._stderr.trim(), root._stdout.trim()]
           .filter(function(s) { return s.length > 0 }).join("\n")
         root.errorText = errText || ("hermes exited with code " + exitCode)
@@ -428,7 +488,7 @@ Panel {
   }
 
   // Hard deadline for a chat job: if it's still running when this fires,
-  // it's killed regardless of --run-budget.
+  // it's stopped regardless of --run-budget.
   Timer {
     id: chatDeadlineTimer
     interval: root.chatHardTimeoutSeconds * 1000
@@ -437,11 +497,10 @@ Panel {
       "Hermes didn't respond within " + root.chatHardTimeoutSeconds + "s and was stopped.")
   }
 
-  // Last-resort hard stop if the process-group wrapper's own TERM/KILL
-  // escalation somehow didn't bring the job down in time.
+  // Last-resort stop if the supervisor somehow hasn't exited in time.
   Timer {
     id: killFallbackTimer
-    interval: (root.killGraceSeconds + 5) * 1000
+    interval: (Hermes.killGraceSeconds + 5) * 1000
     repeat: false
     onTriggered: if (chatProcess.running) chatProcess.running = false
   }
@@ -450,6 +509,8 @@ Panel {
     id: notifyProcess
     running: false
     command: []
+    clearEnvironment: true
+    environment: root.sessionEnvironment
   }
 
   BarIconButton {
@@ -475,19 +536,10 @@ Panel {
     bar: root.bar
     open: root.opened
     // Land keyboard focus straight in the composer so SUPER+H (or clicking
-    // the chip) can be followed immediately by typing, no extra click/Tab.
-    // Falls back to escCatcher (which still catches Escape regardless of
-    // where focus lands, since Qt Quick bubbles unhandled key events up the
-    // parent chain) when the field isn't showing, e.g. hermes CLI missing.
+    // the chip) can be followed immediately by typing. Falls back to
+    // escCatcher when the field isn't showing, e.g. Hermes not verified.
     focusTarget: root.hermesAvailable ? draftField : escCatcher
     contentWidth: panel.fittedContentWidth(Style.space(380))
-    // Full natural height (header + every transcript line + footer) is what
-    // the panel WOULD be with no internal scrolling; fittedContentHeight
-    // caps it at 520px. When it's under the cap, transcriptFlick ends up
-    // exactly as tall as its content and never scrolls — same look as
-    // before this changed. When it's over, the footer (composer + quick
-    // actions) still gets its full natural height since it's bottom-anchored
-    // outside the scroll area, and transcriptFlick absorbs the deficit.
     contentHeight: panel.fittedContentHeight(
       topSection.implicitHeight + Style.space(12) + transcriptColumn.implicitHeight + Style.space(12) + bottomSection.implicitHeight,
       Style.space(520)
@@ -509,7 +561,8 @@ Panel {
         PanelHero {
           width: parent.width
           title: "Hermes"
-          meta: !root.hermesAvailable ? "hermes CLI not found on PATH"
+          meta: root.verifyStatus === "checking" ? "Checking the Hermes install…"
+            : !root.hermesAvailable ? "Hermes install not verified"
             : root.busy ? "Thinking…"
             : "Ready"
           foreground: root.foreground
@@ -527,15 +580,15 @@ Panel {
           wrapMode: Text.WordWrap
         }
 
-        // --- hermes CLI missing --------------------------------------------
+        // --- Hermes missing, altered, or not approved ----------------------
         Column {
-          visible: !root.hermesAvailable
+          visible: root.verifyStatus !== "ok" && root.verifyStatus !== "checking"
           width: parent.width
           spacing: Style.space(8)
 
           Text {
             width: parent.width
-            text: "The `hermes` command isn't on PATH for this shell, so quick chat can't run. Open a terminal and run `hermes doctor` to check your install."
+            text: root.unavailableMessage()
             textFormat: Text.PlainText
             color: root.dim
             font.family: root.fontFamily
@@ -543,11 +596,23 @@ Panel {
             wrapMode: Text.WordWrap
           }
 
-          Button {
-            text: "Re-check"
-            foreground: root.foreground
-            bordered: true
-            onClicked: root.checkHermesAvailable()
+          Row {
+            spacing: Style.space(6)
+
+            Button {
+              text: "Re-check"
+              foreground: root.foreground
+              bordered: true
+              onClicked: root.verifyHermes()
+            }
+
+            Button {
+              visible: root.verifyStatus === "unapproved" && !!root.verifyInfo.approval
+              text: "Trust hermes-agent " + (root.verifyInfo.version || "")
+              foreground: root.foreground
+              bordered: true
+              onClicked: root.approveInstalledHermes()
+            }
           }
         }
       }
@@ -597,10 +662,8 @@ Panel {
               Text {
                 width: parent.width
                 // Plain text, deliberately: this renders your own typed
-                // messages AND the model's replies. AutoText's default
-                // markup-sniffing could otherwise turn adversarial-looking
-                // content (a stray <img>/<a> the model echoes) into a live
-                // rendered link or image fetch instead of inert text.
+                // messages AND the model's replies, so nothing the model
+                // echoes can become a live link or image fetch.
                 text: modelData.text
                 textFormat: Text.PlainText
                 color: root.foreground

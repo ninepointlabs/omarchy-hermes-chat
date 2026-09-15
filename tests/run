@@ -1,0 +1,11 @@
+#!/usr/bin/bash
+# Runs every test: ./tests/run
+set -u
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+status=0
+step() { printf '\n== %s\n' "$1"; shift; "$@" || status=1; }
+step "bin/hermes-state and bin/hermes-verify (python unittest)" /usr/bin/python3 -I -B -m unittest discover -s tests -p 'test_*.py'
+step "Hermes.js command construction (node --test)" node --test tests/hermes-js.test.cjs
+step "bin/bounded-run behaviour" tests/bounded-run.test.sh bin/bounded-run
+step "PATH / BASH_ENV / PYTHONPATH shadow proof" tests/shadow-proof.sh
+exit "$status"
