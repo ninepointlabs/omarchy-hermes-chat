@@ -3,7 +3,7 @@
   "id": "tim.hermes-chat",
   "name": "Hermes Chat",
   "version": "0.1.0",
-  "author": "tim",
+  "author": "Nine Point Labs",
   "description": "Bar icon + dropdown for sending a quick message to your local Hermes agent without opening the desktop app.",
   "kinds": [
     "bar-widget"
