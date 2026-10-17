@@ -81,6 +81,8 @@ Panel {
   // Set right before killChatProcess() signals the job, so onExited can show
   // *why* it ended instead of a bare "hermes exited with code N".
   property string _killReason: ""
+  // The About page replaces the chat inside the same dropdown.
+  property bool showAbout: false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -311,10 +313,23 @@ Panel {
   // would plug in if this shell grows a haptics/sound hook later.
   function haptic() {}
 
+  // Swaps the About page in or out. Focus moves to escCatcher while it shows
+  // (so Esc steps back) and returns to the composer afterwards.
+  function setAbout(on) {
+    root.showAbout = !!on
+    Qt.callLater(function() {
+      if (root.showAbout) escCatcher.forceActiveFocus()
+      else if (root.opened) (root.hermesAvailable ? draftField : escCatcher).forceActiveFocus()
+    })
+  }
+
   // Re-read on every open (not just once at startup) so switching monitors
   // — a genuinely different component instance — picks up whatever the
   // last-used monitor's instance wrote.
-  onOpenedChanged: if (opened) { root.errorText = ""; root.readState() }
+  onOpenedChanged: {
+    if (opened) { root.errorText = ""; root.readState() }
+    else root.showAbout = false
+  }
 
   Component.onCompleted: root.resolveBinaries()
   // Panel/plugin teardown: fire TERM at whatever chat job is still running.
@@ -488,7 +503,7 @@ Panel {
     // before this changed. When it's over, the footer (composer + quick
     // actions) still gets its full natural height since it's bottom-anchored
     // outside the scroll area, and transcriptFlick absorbs the deficit.
-    contentHeight: panel.fittedContentHeight(
+    contentHeight: panel.fittedContentHeight(root.showAbout ? aboutView.implicitHeight :
       topSection.implicitHeight + Style.space(12) + transcriptColumn.implicitHeight + Style.space(12) + bottomSection.implicitHeight,
       Style.space(520)
     )
@@ -497,10 +512,33 @@ Panel {
       id: escCatcher
       anchors.fill: parent
       focus: true
-      Keys.onEscapePressed: root.close()
+      // Esc steps back out of About before it closes the dropdown.
+      Keys.onEscapePressed: root.showAbout ? root.setAbout(false) : root.close()
+
+      Flickable {
+        anchors.fill: parent
+        visible: root.showAbout
+        contentWidth: width
+        contentHeight: aboutView.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
+        interactive: contentHeight > height
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+        AboutView {
+          id: aboutView
+          width: parent.width
+          visible: root.showAbout
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          onBackRequested: root.setAbout(false)
+        }
+      }
 
       Column {
         id: topSection
+        visible: !root.showAbout
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
@@ -514,6 +552,16 @@ Panel {
             : "Ready"
           foreground: root.foreground
           fontFamily: root.fontFamily
+          trailingControl: Component {
+            PanelActionButton {
+              objectName: "aboutButton"
+              iconText: "󰋽"
+              tooltipText: "About Hermes Chat"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: root.setAbout(true)
+            }
+          }
         }
 
         Text {
@@ -557,6 +605,7 @@ Panel {
       // scrolled out of view, however long the conversation gets.
       Flickable {
         id: transcriptFlick
+        visible: !root.showAbout
         anchors.top: topSection.bottom
         anchors.topMargin: Style.space(12)
         anchors.left: parent.left
@@ -616,6 +665,7 @@ Panel {
       // --- composer + quick actions — fixed to the bottom, always visible.
       Column {
         id: bottomSection
+        visible: !root.showAbout
         anchors.bottom: parent.bottom
         anchors.left: parent.left
         anchors.right: parent.right

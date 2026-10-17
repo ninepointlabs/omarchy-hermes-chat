@@ -30,7 +30,7 @@ fi
 # overwritten.
 STAGE="$(mktemp -d "$PARENT/.hermes-chat.staging.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT
-cp "$DIR"/*.qml "$DIR"/manifest.json "$STAGE/"
+cp "$DIR"/*.qml "$DIR"/*.js "$DIR"/manifest.json "$DIR"/LICENSE "$STAGE/"
 omarchy plugin validate "$STAGE"
 
 # Atomic swap: move the old install aside, rename the validated stage into
@@ -52,7 +52,7 @@ else
 fi
 trap - EXIT
 
-echo "Installed $DIR/*.{qml,json} -> $TARGET/"
+echo "Installed $DIR/*.{qml,js}, manifest.json and LICENSE -> $TARGET/"
 
 if omarchy bar put tim.hermes-chat; then
   echo "Added the Hermes Chat widget to your bar (right section)."

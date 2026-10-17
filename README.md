@@ -34,6 +34,13 @@ Electron app is open, and does **not** require the persistent gateway
   on, you get a `notify-send` notification with a preview of the reply,
   but only if the dropdown was closed when the reply arrived (so you don't
   get pinged for something you were already watching).
+- **About** — the 󰋽 info button next to the dropdown's "Hermes" title
+  swaps the chat for an About page: version, license (readable in place),
+  Nine Point Labs, the support address,
+  [help@ninepointlabs.com](mailto:help@ninepointlabs.com), with Email,
+  Copy and "Copy version details" buttons, and what the plugin does with
+  your data. The back button or <kbd>Esc</kbd> returns to the chat; closing
+  the dropdown always brings you back to the chat next time.
 
 ## Dependencies
 
@@ -101,6 +108,9 @@ o.bind("SUPER + H", "Hermes chat", "omarchy-shell shell toggle tim.hermes-chat")
 
 Then run `hyprctl reload`.
 
+Inside the dropdown: <kbd>Enter</kbd> sends, <kbd>Esc</kbd> closes it (or,
+on the About page, goes back to the chat).
+
 ## Uninstall
 
 ```bash
@@ -127,6 +137,19 @@ base classes and controls this plugin builds on — same components
 Omarchy shell updates as long as those don't change shape. `omarchy plugin
 validate <folder>` (ships with Omarchy) checks the manifest against the
 current schema if something breaks later.
+
+## Tests
+
+```bash
+node --test tests/
+```
+
+Checks the About page's facts against the real `manifest.json`, `LICENSE`
+and first commit, and its privacy statement against `Panel.qml`: that the
+message still goes to the local `hermes` CLI over stdin, where the
+transcript is stored, and that no network host or network client is added
+to the plugin without being named there. Needs only Node; nothing runs
+`hermes` or touches the network.
 
 ## License
 
