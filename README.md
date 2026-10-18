@@ -115,7 +115,7 @@ on the About page, goes back to the chat).
 
 ```bash
 omarchy plugin disable tim.hermes-chat
-rm ~/.config/omarchy/plugins/hermes-chat
+rm -r ~/.config/omarchy/plugins/hermes-chat
 rm -rf ~/.local/state/omarchy/hermes-chat   # drops the conversation/notify state too
 ```
 
